@@ -2,7 +2,7 @@
 """
 vcompress_abav1.py - 基于 Rust 后端 ab-av1 的高级择优视频压缩与 VMAF 质量搜索引擎
 支持低内存通宵模式 (--low-memory / --vmaf-threads 2)：防内存暴涨至 16GB，限制 VMAF 线程数与 1920x1080 降采样计算，内存占用锁定在 1~2GB 内。
-修复 ab-av1 NDJSON 多行输出解析逻辑。
+使用 ab-av1 crf-search 二分查找最佳 CRF，全量转码采用原生 FFmpeg 隔离 Apple mebx 数据轨。
 """
 
 import os
@@ -116,7 +116,7 @@ def map_encoder_flag(encoder):
     return encoder
 
 def run_ab_av1_search(input_path, encoder_name, min_vmaf, max_percent, sample_sec=10, samples_cnt=3, vmaf_threads=2, scale_1080p=True):
-    """使用 ab-av1 crf-search 二分搜寻，加入内存与线程数限制参数防暴占用"""
+    """使用 ab-av1 crf-search 二分搜寻最佳 CRF/QP"""
     enc_flag = map_encoder_flag(encoder_name)
     cmd = [
         'ab-av1', 'crf-search',
@@ -139,7 +139,6 @@ def run_ab_av1_search(input_path, encoder_name, min_vmaf, max_percent, sample_se
 
     try:
         res = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        # 支持解析 NDJSON (JSON Lines) 多行输出，取最后一行有效输出
         lines = [line.strip() for line in res.stdout.strip().splitlines() if line.strip()]
         for line in reversed(lines):
             try:
@@ -158,29 +157,41 @@ def run_ab_av1_search(input_path, encoder_name, min_vmaf, max_percent, sample_se
         return None
 
 def run_ab_av1_encode(input_path, output_path, encoder_name, crf_val, preset=None):
-    """使用 ab-av1 auto-encode 进行全量转码"""
+    """使用原生 FFmpeg 进行全量转码，隔离 Apple mebx 沉浸数据轨"""
     enc_flag = map_encoder_flag(encoder_name)
     cmd = [
-        'ab-av1', 'auto-encode',
+        'ffmpeg', '-y',
         '-i', str(input_path),
-        '-o', str(output_path),
-        '--encoder', enc_flag,
-        '--crf', str(crf_val),
-        '--temp-dir', '/tmp'
+        '-map', '0:v:0',
+        '-map', '0:a?',
+        '-c:v', enc_flag,
+        '-c:a', 'copy',
+        '-movflags', '+faststart'
     ]
     if enc_flag == 'hevc_videotoolbox':
-        cmd.extend(['--high-crf-means-hq', 'true'])
+        cmd.extend(['-q:v', str(int(crf_val)), '-tag:v', 'hvc1'])
+    elif enc_flag == 'libx265':
+        cmd.extend(['-crf', str(crf_val), '-tag:v', 'hvc1'])
+    elif enc_flag == 'libsvtav1':
+        cmd.extend(['-crf', str(crf_val)])
+    elif enc_flag == 'libx264':
+        cmd.extend(['-crf', str(crf_val)])
+    else:
+        cmd.extend(['-q:v', str(crf_val)])
+
     if preset:
-        cmd.extend(['--preset', str(preset)])
+        cmd.extend(['-preset', str(preset)])
+
+    cmd.append(str(output_path))
 
     try:
         process = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         if process.returncode != 0:
-            logger.error(f"ab-av1 编码失败: {process.stderr.decode('utf-8', errors='ignore')}")
+            logger.error(f"FFmpeg 编码失败: {process.stderr.decode('utf-8', errors='ignore')}")
             return False
         return True
     except Exception as e:
-        logger.error(f"执行 ab-av1 转码异常: {e}")
+        logger.error(f"执行 FFmpeg 转码异常: {e}")
         return False
 
 def process_file_abav1(src_path, out_path, args):
