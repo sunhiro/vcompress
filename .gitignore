@@ -4,9 +4,15 @@ __pycache__/
 *$py.class
 *.so
 
+# ab-av1 temp files
+.ab-av1*
+*.mkv
+*.hevc_videotoolbox.*
+
 # Logs & Temporary Files
 *.log
 vcompress.log
+vcompress_abav1.log
 output/
 temp/
 scratch/
