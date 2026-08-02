@@ -2,6 +2,7 @@
 """
 vcompress_abav1.py - 基于 Rust 后端 ab-av1 的高级择优视频压缩与 VMAF 质量搜索引擎
 支持低内存通宵模式 (--low-memory / --vmaf-threads 2)：防内存暴涨至 16GB，限制 VMAF 线程数与 1920x1080 降采样计算，内存占用锁定在 1~2GB 内。
+修复 ab-av1 NDJSON 多行输出解析逻辑。
 """
 
 import os
@@ -130,7 +131,6 @@ def run_ab_av1_search(input_path, encoder_name, min_vmaf, max_percent, sample_se
         '--stdout-format', 'json'
     ]
 
-    # 低内存控制：4K 视频算 VMAF 时缩放到 1920x1080，内存节省 75%，防止 4K 未压缩帧在内存中堆积
     if scale_1080p:
         cmd.extend(['--vmaf-scale', '1920x1080'])
 
@@ -139,8 +139,17 @@ def run_ab_av1_search(input_path, encoder_name, min_vmaf, max_percent, sample_se
 
     try:
         res = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        data = json.loads(res.stdout.strip())
-        return data
+        # 支持解析 NDJSON (JSON Lines) 多行输出，取最后一行有效输出
+        lines = [line.strip() for line in res.stdout.strip().splitlines() if line.strip()]
+        for line in reversed(lines):
+            try:
+                data = json.loads(line)
+                if "crf" in data:
+                    return data
+            except Exception:
+                continue
+        logger.error(f"无法找到有效的 ab-av1 JSON 结果行，输出为:\n{res.stdout}")
+        return None
     except subprocess.CalledProcessError as e:
         logger.error(f"ab-av1 crf-search 失败: {e.stderr}")
         return None
