@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 vcompress_abav1.py - 基于 Rust 后端 ab-av1 的高级择优视频压缩与 VMAF 质量搜索引擎
-支持多线程高性能测算 (--vmaf-threads 6，预算约 8GB RAM)，自动生成台账文件 (_report.csv)。
-使用 ab-av1 crf-search 二分查找最佳 CRF，全量转码采用原生 FFmpeg 隔离 Apple mebx 数据轨。
+支持多线程高性能模式 (--vmaf-threads 6，预算约 8GB RAM)，自动生成 CSV/Excel/HTML 三重台账。
+已支持断点续压（自动跳过目标目录下已压过的产物）。
 """
 
 import os
@@ -14,6 +14,7 @@ import json
 import logging
 import csv
 from pathlib import Path
+from export_report import build_excel_report, build_html_report
 
 # 日志配置
 logging.basicConfig(
@@ -308,6 +309,8 @@ def main():
     out_dir = args.output if args.output.is_dir() or not args.output.suffix else args.output.parent
     out_dir.mkdir(parents=True, exist_ok=True)
     report_csv = out_dir / "_report.csv"
+    report_xlsx = out_dir / "_report.xlsx"
+    report_html = out_dir / "_report.html"
 
     if not report_csv.exists():
         with open(report_csv, 'w', encoding='utf-8', newline='') as f:
@@ -323,6 +326,12 @@ def main():
     for idx, file_path in enumerate(files, 1):
         rel_path = file_path.relative_to(base_dir) if args.input.is_dir() else file_path.name
         out_path = args.output / rel_path if args.input.is_dir() else args.output
+
+        # 断点续压：若目标压缩产物已存在且非空，自动跳过
+        if out_path.exists() and out_path.stat().st_size > 0 and not args.preview:
+            logger.info(f"[{idx}/{len(files)}] [断点续压: 已存在] 跳过: {rel_path}")
+            skipped_cnt += 1
+            continue
 
         logger.info(f"\n[{idx}/{len(files)}] 检查中: {rel_path}")
         status, orig_mb, new_mb, saving, vmaf, crf_val, decision, pix_fmt = process_file_abav1(file_path, out_path, args)
@@ -342,10 +351,17 @@ def main():
         else:
             failed_cnt += 1
 
+    # 运行完毕自动刷新导出 Excel 与 HTML 报表
+    try:
+        build_excel_report(report_csv, report_xlsx)
+        build_html_report(report_csv, report_html)
+    except Exception as e:
+        logger.error(f"导出 Excel/HTML 台账发生异常: {e}")
+
     logger.info("\n" + "="*60)
     logger.info(f"择优压缩任务完成: 高性价比压缩成功 {success_cnt} 个, 低性价比/已压缩跳过 {skipped_cnt} 个, 拦截/失败 {failed_cnt} 个")
     logger.info(f"累计释放磁盘空间: {total_saved_mb/1024:.2f} GB ({total_saved_mb:.1f} MB)")
-    logger.info(f"结构化压缩台账文件已保存至: {report_csv}")
+    logger.info(f"结构化台账已导出: CSV={report_csv} | Excel={report_xlsx} | HTML={report_html}")
     logger.info("="*60)
 
 if __name__ == "__main__":
