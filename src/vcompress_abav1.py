@@ -289,7 +289,9 @@ def main():
     parser.add_argument('--min-file-mb', type=float, default=20.0, help='跳过压缩的小文件阈值 MB (默认 20.0MB)')
     parser.add_argument('--max-hevc-bitrate', type=float, default=30.0, help='HEVC 视频最大跳过码率 Mbps，低于此码率的 HEVC 不再重压 (默认 30.0Mbps)')
     parser.add_argument('--min-bitrate', type=float, default=2.5, help='视频最低码率 Mbps，低于此码率视频跳过重压 (默认 2.5Mbps)')
-    parser.add_argument('--skip-hdr', action='store_true', default=True, help='自动跳过 10-bit / HDR 视频以保持极高性价比 (默认开启)')
+    parser.add_argument('--skip-hdr', dest='skip_hdr', action='store_true', help='自动跳过 10-bit / HDR 视频以保持极高性价比')
+    parser.add_argument('--no-skip-hdr', dest='skip_hdr', action='store_false', help='强制压制 10-bit / HDR 视频')
+    parser.set_defaults(skip_hdr=False)
     parser.add_argument('--vmaf-threads', type=int, default=6, help='VMAF 计算允许的最大线程数 (默认 6，预算 ~8GB RAM)')
     parser.add_argument('--no-vmaf-scale', dest='vmaf_scale_1080p', action='store_false', help='关闭 VMAF 计算时的 1080p 缩放 (默认开启 1080p 缩放)')
     parser.set_defaults(vmaf_scale_1080p=True)
@@ -297,6 +299,7 @@ def main():
     parser.add_argument('--samples', type=int, default=3, help='采样切片数量 (默认 3 段)')
     parser.add_argument('--preset', help='编码器 Preset 预设')
     parser.add_argument('--preview', action='store_true', help='Preview 模式: 仅做二分法测算评估，不输出全量转码文件')
+    parser.add_argument('--json-out', action='store_true', help='单文件模式：处理完毕后向 stdout 输出一行 JSON 结果（供 vcat compress-worker 解析）')
 
     args = parser.parse_args()
 
@@ -342,6 +345,29 @@ def main():
         with open(report_csv, 'a', encoding='utf-8', newline='') as f:
             writer = csv.writer(f)
             writer.writerow([rel_csv_str, f"{orig_mb:.2f}", f"{new_mb:.2f}", f"{saving:.1f}", str(vmaf), str(crf_val), decision, pix_fmt])
+
+        # --json-out：向 stdout 输出一行机器可读 JSON（供 vcat compress-worker 解析）
+        if getattr(args, 'json_out', False):
+            out_size = int(new_mb * 1024 * 1024) if new_mb else None
+            if status == "success":
+                json_status = "success"
+            elif status.startswith("skipped"):
+                # 区分性价比不足（quality_rejected 语义）vs 纯跳过
+                json_status = "quality_rejected" if status == "failed" else "skipped"
+            else:
+                json_status = "failed"
+            result_json = {
+                "status": json_status,
+                "out_path": str(out_path) if status == "success" and out_path.exists() else None,
+                "out_size": out_size if status == "success" else None,
+                "vmaf_mean": float(vmaf) if vmaf not in ("NA", None) else None,
+                "vmaf_min": float(vmaf) if vmaf not in ("NA", None) else None,
+                "crf_val": crf_val if crf_val != "NA" else None,
+                "detail": decision,
+            }
+            # 独立打印到 stdout（与 logger 写 stderr/文件分离，不会被 logger 截断）
+            sys.stdout.write(json.dumps(result_json, ensure_ascii=False) + "\n")
+            sys.stdout.flush()
 
         if status == "success":
             success_cnt += 1
