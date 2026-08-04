@@ -104,6 +104,7 @@ def get_video_metadata(file_path):
     try:
         probe_cmd = [
             'ffprobe', '-v', 'error',
+            '-select_streams', 'v:0',
             '-show_entries', 'stream=codec_name,height,width',
             '-show_entries', 'format=duration,bit_rate',
             '-of', 'json',
