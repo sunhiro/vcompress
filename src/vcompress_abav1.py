@@ -15,6 +15,9 @@ import logging
 import csv
 from pathlib import Path
 from export_report import build_excel_report, build_html_report
+from naming import marked_name
+from fullset import (read_manifest, write_manifest, manifest_row, full_hash,
+                     plan_move_untouched, apply_moves)
 
 # 日志配置
 logging.basicConfig(
@@ -299,6 +302,11 @@ def main():
     parser.add_argument('--samples', type=int, default=3, help='采样切片数量 (默认 3 段)')
     parser.add_argument('--preset', help='编码器 Preset 预设')
     parser.add_argument('--preview', action='store_true', help='Preview 模式: 仅做二分法测算评估，不输出全量转码文件')
+    parser.add_argument('--move-untouched', action='store_true',
+                        help='把不值得压的源片也搬进输出目录，使其成为可整体拷贝的「全集」。'
+                             '同分区 rename、秒级。🔴 默认关闭：搬运本身不减少副本数，'
+                             '但前提是这些文件在别处还有备份——源目录搬空之后就不是备份了。'
+                             '开之前先确认（vcat 用户可看 `vcat status --cold` 的孤本数）。')
     parser.add_argument('--json-out', action='store_true', help='单文件模式：处理完毕后向 stdout 输出一行 JSON 结果（供 vcat compress-worker 解析）')
 
     args = parser.parse_args()
@@ -321,6 +329,10 @@ def main():
             writer = csv.writer(f)
             writer.writerow(['文件', '原MB', '新MB', '省%', 'VMAF', 'CRF/Q', '决定', '像素格式'])
 
+    # 内容清单（upsert）。与 _report.csv 的分工：那个是「本次跑了什么」的运行日志，
+    # 这个是「这棵树里有什么」的账。追加式日志补不回漏掉的行，清单能从树上重建。
+    manifest = read_manifest(out_dir)
+
     logger.info(f"启动多线程择优压缩流程，源目录: {args.input} ➔ 目标目录: {args.output}")
     logger.info(f"待扫描视频文件总数: {len(files)} 个。内存优化: VMAF线程={args.vmaf_threads} (预算 ~8GB RAM) | 小文件门限={args.min_file_mb}MB")
 
@@ -329,7 +341,9 @@ def main():
 
     for idx, file_path in enumerate(files, 1):
         rel_path = file_path.relative_to(base_dir) if args.input.is_dir() else file_path.name
-        out_path = args.output / rel_path if args.input.is_dir() else args.output
+        # 产物带 .hevc 标记（naming.py 说明了为什么）。单文件模式下输出路径由
+        # 调用方（vcat compress worker）给全，它自己已经加过标记，这里不再动。
+        out_path = args.output / marked_name(rel_path) if args.input.is_dir() else args.output
 
         # 断点续压：若目标压缩产物已存在且非空，自动跳过
         if out_path.exists() and out_path.stat().st_size > 0 and not args.preview:
@@ -373,10 +387,35 @@ def main():
             success_cnt += 1
             saved = orig_mb - new_mb
             total_saved_mb += saved
+            if args.input.is_dir() and out_path.exists():
+                dst_rel = str(out_path.relative_to(out_dir))
+                manifest[dst_rel] = manifest_row(
+                    dst_rel=dst_rel, src_rel=str(rel_path),
+                    dst_bytes=out_path.stat().st_size, src_bytes=file_path.stat().st_size,
+                    dst_hash=full_hash(out_path), src_hash=full_hash(file_path),
+                    vmaf=None if vmaf in ("NA", None) else vmaf,
+                    encoder=args.encoder, tool="vcompress_abav1.py",
+                )
         elif status.startswith("skipped"):
             skipped_cnt += 1
         else:
             failed_cnt += 1
+
+    if args.input.is_dir():
+        logger.info(f"内容清单已更新: {write_manifest(out_dir, manifest)}（{len(manifest)} 行）")
+
+        if args.move_untouched:
+            moves, problems = plan_move_untouched(args.input, out_dir)
+            for prob in problems:
+                logger.error(f"[搬运跳过] {prob}")
+            if problems:
+                # 宁可不搬，也不在有疑点的情况下动用户的文件（红线：宁可拒绝，不可错）
+                logger.error(f"存在 {len(problems)} 处问题，本次不执行搬运")
+            else:
+                ok, relocked = apply_moves(moves)
+                logger.info(f"全集搬运完成: 移入 {ok} 个未压缩源片"
+                            f"（其中 {relocked} 个的 uchg 不可变标志已原样贴回）")
+                logger.info(f"输出目录现在是全集，源目录只剩被压过的那批源片（作备份）")
 
     # 运行完毕自动刷新导出 Excel 与 HTML 报表
     try:

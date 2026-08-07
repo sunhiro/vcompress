@@ -45,6 +45,10 @@ import random
 import tempfile
 from pathlib import Path
 
+from naming import marked_name
+from fullset import (read_manifest, write_manifest, manifest_row, full_hash,
+                     plan_move_untouched, apply_moves)
+
 # Setup logging
 logging.basicConfig(
     level=logging.INFO,
@@ -895,6 +899,10 @@ def main():
     parser.add_argument('--audio', type=str, default='copy', help='Audio codec (copy/aac)')
     parser.add_argument('--vmaf-dur', type=int, default=30, help='VMAF check duration (0 for full video)')
     parser.add_argument('--preview', type=int, nargs='?', const=3, help='Preview mode: randomly process N files and exit without saving')
+    parser.add_argument('--move-untouched', action='store_true',
+                        help='把不值得压的源片也搬进输出目录，使其成为可整体拷贝的「全集」。'
+                             '同分区 rename、秒级。🔴 默认关闭：搬运不减少副本数，但前提是'
+                             '这些文件在别处还有备份——源目录搬空之后就不是备份了。')
     parser.add_argument('--preview-sample-sec', type=int, default=30, help='Preview 模式下只压中间这么多秒做快速估算 (default: 30)')
     parser.add_argument('--allow-vt-hevc', action='store_true', help='允许对 HEVC 源使用硬件 vt 编码(默认自动改用软件 x265)')
     parser.add_argument('--recompress-hevc', action='store_true', help='Force re-compression of already HEVC/H.265 videos (useful for high-bitrate files)')
@@ -992,6 +1000,9 @@ def main():
         
     out_dir.mkdir(parents=True, exist_ok=True)
     report_path = out_dir / "_report.csv"
+    # 内容清单（upsert）。_report.csv 是「本次跑了什么」的运行日志，
+    # 这个是「这棵树里有什么」的账 —— 后者能从树上重建，前者补不回漏掉的行。
+    manifest = read_manifest(out_dir)
     
     # Initialize report
     if not report_path.exists():
@@ -1011,7 +1022,10 @@ def main():
         # Avoid commas in CSV filename representation
         rel_path_csv = str(rel_path).replace(',', ' ')
         
-        out_path = out_dir / rel_path.with_suffix('.mp4')
+        # 🔴 曾经是 `rel_path.with_suffix('.mp4')`，强制把容器改成 mp4。
+        # 在「输出目录是全集」的布局下这会静默覆盖：源 A.MOV 的产物写成 A.mp4，
+        # 而同目录一个未压缩的 A.mp4 搬进来时正好同名。现在容器沿用源、只插标记。
+        out_path = out_dir / marked_name(rel_path)
         
         # Skip if already exists (breakpoint resume)
         if out_path.exists() and not args.preview:
@@ -1068,6 +1082,15 @@ def main():
             saved_mb = orig_mb - new_mb
             total_saved_bytes += saved_mb * 1024 * 1024
             decision = "保留压缩版"
+            if out_path.exists():
+                dst_rel = str(out_path.relative_to(out_dir))
+                manifest[dst_rel] = manifest_row(
+                    dst_rel=dst_rel, src_rel=str(rel_path),
+                    dst_bytes=out_path.stat().st_size, src_bytes=src_path.stat().st_size,
+                    dst_hash=full_hash(out_path), src_hash=full_hash(src_path),
+                    vmaf=None if vmaf in ("NA", None) else vmaf,
+                    encoder=getattr(args, "encoder", ""), tool="vcompress.py",
+                )
             logger.info(f"   [SUCCESS] Kept compressed file. Saved {saved_mb:.2f} MB ({saving:.1f}%)")
         else:
             n_fail += 1
@@ -1092,6 +1115,19 @@ def main():
         with open(report_path, 'a', encoding='utf-8') as f:
             f.write(f'"{rel_path_csv}",{orig_mb:.2f},{new_mb:.2f},{saving:.1f},{vmaf},{q_val},{decision},{pix_col}\n')
             
+    logger.info(f"内容清单已更新: {write_manifest(out_dir, manifest)}（{len(manifest)} 行）")
+
+    if args.move_untouched:
+        moves, problems = plan_move_untouched(src_dir, out_dir)
+        for prob in problems:
+            logger.error(f"[搬运跳过] {prob}")
+        if problems:
+            logger.error(f"存在 {len(problems)} 处问题，本次不执行搬运（宁可拒绝，不可错）")
+        else:
+            ok, relocked = apply_moves(moves)
+            logger.info(f"全集搬运完成: 移入 {ok} 个未压缩源片"
+                        f"（其中 {relocked} 个的 uchg 不可变标志已原样贴回）")
+
     logger.info(f"\n{'='*60}\nCOMPRESSION RUN SUMMARY\n{'='*60}")
     logger.info(f"Total processed: {n_total}")
     logger.info(f"Successful compressions: {n_keep}")
