@@ -12,6 +12,8 @@
 | [`docs/RED-LINES.md`](../docs/RED-LINES.md) | **12 条红线 + 每条的真机证据。改代码前必读。** 这份比代码重要 |
 | [`docs/REGRESSION.md`](../docs/REGRESSION.md) | 已知坏例、预期结论、**已证伪的假说清单**。改完必跑 |
 | [`REVIEW_FROM_VCAT.md`](../REVIEW_FROM_VCAT.md) | 对解耦提案的完整评审 + 本次迁移做了什么 |
+| [`win/CLAUDE.md`](../win/CLAUDE.md) | **Windows 侧 SSIM 引擎**的分工理由与四个评分坑（2026-08-13 从 nas 仓迁入）。🔴 两套引擎按平台分工，别再合并或退役其一 |
+| [`archive/2026-08-13-win压缩与质量分-原始记忆.md`](archive/2026-08-13-win压缩与质量分-原始记忆.md) | Windows 侧压缩/评分的原始笔记（逐字归档，按需读） |
 
 ---
 
