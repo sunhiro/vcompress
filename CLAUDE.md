@@ -9,6 +9,21 @@
 - **一句话价值**：为大容量外接硬盘/NAS 提供**“高压缩比 + 视觉无损 + 自动撤销拦截”**的可靠视频压缩服务。
 - **项目由来**：从 `nas` 仓库和 `vcat` 项目中解耦独立，作为**专一、高效、独立维护**的转码/评分核心引擎。
 - **与 `vcat` 的关系**：`vcompress` 专注于视频底层转码、元数据保护与 VMAF 计算；`vcat` 为资产台账管理大脑，未来可调用 `vcompress` 作为 worker 模块。
+- **与 `varchive` 的关系**：`varchive`（`d:\work\1_project\varchive\`）是家庭影像最终归档工程，
+  是本项目与 `vcat` 的**母项目**——两者都是从那条主线上衍生出去的工具。T7 批压缩属于它的"移动盘线"。
+
+## 🔴 两套引擎，按平台分工（2026-08-13 起，别再合并或退役其一）
+
+| | `src/`（本体） | `win/` |
+|---|---|---|
+| 平台 | **macOS** | **Windows** |
+| ffmpeg | 完整 ffmpeg + ab-av1 | digiKam 自带，**`--disable-libvmaf`，跑不了 VMAF** |
+| 质量评分 | **VMAF** 二分查找 | **SSIM / PSNR** |
+| 接入 | Mac 上跑 T7 批处理 | `bin\{compress,compare,sort}-video.cmd`、yazi `\` 菜单、用户级 skill `video-compress` |
+
+`win/` 是 2026-08-13 从 `nas` 仓的 `video/` 迁入的。此前"从 nas 解耦独立"**只做了一半**：
+旧那套一直活着且是 Windows 侧唯一入口，两边谁也没指认谁，每个新会话都要重新纠结一遍。
+**详细分工理由与 Windows 侧的评分坑见 `win/CLAUDE.md`**（触及该目录时 harness 自动加载）。
 
 ---
 
