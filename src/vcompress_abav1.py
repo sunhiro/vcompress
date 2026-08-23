@@ -13,11 +13,12 @@ import argparse
 import json
 import logging
 import csv
+import datetime as dt
 from pathlib import Path
 from export_report import build_excel_report, build_html_report
 from naming import marked_name
 from fullset import (read_manifest, write_manifest, manifest_row, full_hash,
-                     plan_move_untouched, apply_moves)
+                     plan_move_untouched, apply_moves, HASHING_AVAILABLE)
 
 # 日志配置
 logging.basicConfig(
@@ -281,6 +282,180 @@ def process_file_abav1(src_path, out_path, args):
 
     return "success", orig_mb, new_mb, actual_saving, best_vmaf, best_crf, "保留压缩版", pix_fmt
 
+def write_replace_scripts(input_dir: Path, output_dir: Path):
+    """在输出目录中生成一键替换/统一合并脚本 `_apply_replace.py` 和 `_apply_replace.sh`"""
+    if not input_dir.is_dir():
+        return
+
+    src_abs = input_dir.resolve()
+    out_abs = output_dir.resolve()
+
+    py_script_path = out_abs / "_apply_replace.py"
+    sh_script_path = out_abs / "_apply_replace.sh"
+
+    py_content = f'''#!/usr/bin/env python3
+"""
+_apply_replace.py - 压缩成果人工确认后的覆盖与文件夹合并工具
+自动生成于: {dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+"""
+
+import os
+import sys
+import shutil
+import stat
+from pathlib import Path
+
+SRC_DIR = Path({repr(str(src_abs))})
+OUT_DIR = Path({repr(str(out_abs))})
+
+COMPRESSED_MARKER = ".hevc"
+
+def is_marked(rel_path):
+    p = Path(rel_path)
+    return p.suffix == COMPRESSED_MARKER or p.stem.endswith(COMPRESSED_MARKER)
+
+def unmarked_name(rel_path):
+    p = Path(rel_path)
+    if p.suffix == COMPRESSED_MARKER:
+        return str(p.with_name(p.stem))
+    if not p.stem.endswith(COMPRESSED_MARKER):
+        return str(rel_path)
+    return str(p.with_name(f"{{p.stem[:-len(COMPRESSED_MARKER)]}}{{p.suffix}}"))
+
+def main():
+    if not OUT_DIR.exists():
+        print(f"❌ 错误: 输出目录不存在: {{OUT_DIR}}")
+        sys.exit(1)
+    if not SRC_DIR.exists():
+        print(f"❌ 错误: 源目录不存在: {{SRC_DIR}}")
+        sys.exit(1)
+
+    skip_files = {{"_report.csv", "_report.xlsx", "_report.html", "_manifest.csv", "_apply_replace.py", "_apply_replace.sh"}}
+    
+    products = []
+    for root, dirs, files in os.walk(OUT_DIR):
+        dirs[:] = [d for d in dirs if not d.startswith(".")]
+        for f in files:
+            if f.startswith(".") or f in skip_files:
+                continue
+            fpath = Path(root) / f
+            rel = fpath.relative_to(OUT_DIR)
+            products.append((fpath, rel))
+
+    print("=" * 65)
+    print(" 🎬 vcompress 压缩成果人工确认后的覆盖与统一工具")
+    print("=" * 65)
+    print(f" 源片文件夹 : {{SRC_DIR}}")
+    print(f" 产物文件夹 : {{OUT_DIR}}")
+    print(f" 待覆盖/移动产物 : {{len(products)}} 个视频文件")
+    print("-" * 65)
+
+    if not products:
+        print("ℹ️ 输出目录中未找到可覆盖/合并的压缩视频产物。")
+        return
+
+    replace_pairs = []
+    for fpath, rel in products:
+        rel_str = str(rel)
+        if is_marked(rel_str):
+            orig_rel_str = unmarked_name(rel_str)
+        else:
+            orig_rel_str = rel_str
+
+        orig_path = SRC_DIR / orig_rel_str
+        target_path = SRC_DIR / rel
+
+        orig_mb = orig_path.stat().st_size / (1024 * 1024) if orig_path.exists() else 0.0
+        new_mb = fpath.stat().st_size / (1024 * 1024)
+        
+        replace_pairs.append((fpath, orig_path, target_path, orig_mb, new_mb, orig_rel_str, rel_str))
+        print(f"  • 源文件: {{orig_rel_str}} ({{orig_mb:.1f}} MB)")
+        print(f"  ➔ 替换为: {{rel_str}} ({{new_mb:.1f}} MB)")
+
+    print("-" * 65)
+    print(" ⚠️  警告: 本操作将用压缩版本覆盖/替换源片，并在完成后保留唯一的源文件夹！")
+    print(" 请确保您已人工确认播放过压缩后视频，质量满足要求。")
+    print("-" * 65)
+
+    confirm = input("输入 'y' 或 'yes' 确认执行覆盖与统一文件夹 (其他取消): ").strip().lower()
+    if confirm not in ['y', 'yes']:
+        print("❌ 操作取消，所有文件均未修改。")
+        return
+
+    print("\\n🚀 开始执行文件覆盖与整理...")
+    success_cnt = 0
+
+    for fpath, orig_path, target_path, orig_mb, new_mb, orig_rel_str, rel_str in replace_pairs:
+        # 处理源文件: 若源文件存在且为旧片，解除 uchg 锁定并删除
+        if orig_path.exists():
+            flags = getattr(os.lstat(orig_path), "st_flags", 0)
+            if flags & getattr(stat, "UF_IMMUTABLE", 0):
+                os.chflags(orig_path, flags & ~stat.UF_IMMUTABLE)
+            try:
+                orig_path.unlink()
+                print(f"  [删除旧源片] {{orig_rel_str}}")
+            except Exception as e:
+                print(f"  [删除源片失败] {{orig_rel_str}}: {{e}}")
+                continue
+
+        # 将压缩文件移动到源目录位置
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.rename(fpath, target_path)
+            print(f"  [移动压缩版] {{rel_str}} ➔ {{target_path}}")
+            success_cnt += 1
+        except Exception as e:
+            print(f"  [移动产物失败] {{rel_str}}: {{e}}")
+
+    # 移动台账报表至源目录
+    for rfile in ["_report.csv", "_report.xlsx", "_report.html", "_manifest.csv"]:
+        rf_path = OUT_DIR / rfile
+        if rf_path.exists():
+            try:
+                os.rename(rf_path, SRC_DIR / rfile)
+                print(f"  [迁移台账] {{rfile}} ➔ {{SRC_DIR / rfile}}")
+            except Exception as e:
+                pass
+
+    # 清理已空或剩余脚本的 OUT_DIR
+    for extra in ["_apply_replace.py", "_apply_replace.sh"]:
+        p = OUT_DIR / extra
+        if p.exists():
+            try:
+                p.unlink()
+            except Exception:
+                pass
+    try:
+        shutil.rmtree(OUT_DIR)
+        print(f"  [清理临时目录] 已移除 {{OUT_DIR}}")
+    except Exception as e:
+        print(f"  [提示] 临时目录 {{OUT_DIR}} 尚有遗留，请手动删除: {{e}}")
+
+    print("=" * 65)
+    print(f"✅ 覆盖整理成功！已更新 {{success_cnt}} 个文件。")
+    print(f"📂 唯一的全集文件夹: {{SRC_DIR}}")
+    print("=" * 65)
+
+if __name__ == '__main__':
+    main()
+'''
+
+    sh_content = f'''#!/bin/bash
+# 一键手动确认覆盖与合并脚本
+cd "$(dirname "$0")"
+python3 _apply_replace.py "$@"
+'''
+
+    with open(py_script_path, "w", encoding="utf-8") as f:
+        f.write(py_content)
+    py_script_path.chmod(0o755)
+
+    with open(sh_script_path, "w", encoding="utf-8") as f:
+        f.write(sh_content)
+    sh_script_path.chmod(0o755)
+
+    logger.info(f"一键覆盖合并脚本已自动生成: {sh_script_path} (及 {py_script_path})")
+
 def main():
     check_dependencies()
     parser = argparse.ArgumentParser(description="vcompress_abav1 - 高性价比择优视频压缩与 VMAF 质量搜索引擎 (支持多线程高性能模式及台账自动导出)")
@@ -307,6 +482,10 @@ def main():
                              '同分区 rename、秒级。🔴 默认关闭：搬运本身不减少副本数，'
                              '但前提是这些文件在别处还有备份——源目录搬空之后就不是备份了。'
                              '开之前先确认（vcat 用户可看 `vcat status --cold` 的孤本数）。')
+    # 默认不生成：这个脚本会删掉 -i 指向的源片。它的杀伤力配不上「每次跑完
+    # 都无声生成一份」的行为——尤其当 -i 是一份临时副本时，跑一下就没了。
+    parser.add_argument('--emit-replace-script', action='store_true',
+                        help='额外生成 _apply_replace.py/sh 人工覆盖脚本（会删除 -i 下的源片，默认不生成）')
     parser.add_argument('--json-out', action='store_true', help='单文件模式：处理完毕后向 stdout 输出一行 JSON 结果（供 vcat compress-worker 解析）')
 
     args = parser.parse_args()
@@ -332,6 +511,9 @@ def main():
     # 内容清单（upsert）。与 _report.csv 的分工：那个是「本次跑了什么」的运行日志，
     # 这个是「这棵树里有什么」的账。追加式日志补不回漏掉的行，清单能从树上重建。
     manifest = read_manifest(out_dir)
+    if args.input.is_dir() and not HASHING_AVAILABLE:
+        logger.warning("⚠️ 未安装 blake3，内容清单的哈希列将整列为空——这份清单只能按路径"
+                       "认账，不能用来校验产物完整性。装上：pip install blake3")
 
     logger.info(f"启动多线程择优压缩流程，源目录: {args.input} ➔ 目标目录: {args.output}")
     logger.info(f"待扫描视频文件总数: {len(files)} 个。内存优化: VMAF线程={args.vmaf_threads} (预算 ~8GB RAM) | 小文件门限={args.min_file_mb}MB")
@@ -349,6 +531,22 @@ def main():
         if out_path.exists() and out_path.stat().st_size > 0 and not args.preview:
             logger.info(f"[{idx}/{len(files)}] [断点续压: 已存在] 跳过: {rel_path}")
             skipped_cnt += 1
+            # 跳过转码 ≠ 跳过记账。清单是「这棵树里有什么」的账，中断重跑时
+            # 上一轮的产物只存在于盘上；这里不补登记它就永远进不了清单，而且
+            # 不报任何错——fullset.py 开头讲的「漏记 66 个」正是这个形状。
+            # 只在缺行时补：已有的行不动，免得大树上每次续跑都重算全量哈希。
+            if args.input.is_dir():
+                dst_rel = str(out_path.relative_to(out_dir))
+                if dst_rel not in manifest:
+                    manifest[dst_rel] = manifest_row(
+                        dst_rel=dst_rel, src_rel=str(rel_path),
+                        dst_bytes=out_path.stat().st_size, src_bytes=file_path.stat().st_size,
+                        dst_hash=full_hash(out_path), src_hash=full_hash(file_path),
+                        # 这一轮没测 VMAF，留空而不是编一个数（红线：宁可拒绝，不可错）
+                        vmaf=None,
+                        encoder=args.encoder, tool="vcompress_abav1.py",
+                    )
+                    logger.info(f"   [补登记] 上一轮的产物补进内容清单: {dst_rel}（VMAF 本轮未测，留空）")
             continue
 
         logger.info(f"\n[{idx}/{len(files)}] 检查中: {rel_path}")
@@ -417,12 +615,16 @@ def main():
                             f"（其中 {relocked} 个的 uchg 不可变标志已原样贴回）")
                 logger.info(f"输出目录现在是全集，源目录只剩被压过的那批源片（作备份）")
 
-    # 运行完毕自动刷新导出 Excel 与 HTML 报表
+    # 运行完毕自动刷新导出 Excel 与 HTML 报表，并生成一键人工覆盖脚本
     try:
         build_excel_report(report_csv, report_xlsx)
         build_html_report(report_csv, report_html)
+        if args.emit_replace_script:
+            logger.warning("⚠️ 已生成 _apply_replace.py/sh —— 它会删除 "
+                           f"{args.input} 下的源片并把产物搬过去，确认过再跑。")
+            write_replace_scripts(args.input, out_dir)
     except Exception as e:
-        logger.error(f"导出 Excel/HTML 台账发生异常: {e}")
+        logger.error(f"导出 Excel/HTML 台账或生成覆盖脚本发生异常: {e}")
 
     logger.info("\n" + "="*60)
     logger.info(f"择优压缩任务完成: 高性价比压缩成功 {success_cnt} 个, 低性价比/已压缩跳过 {skipped_cnt} 个, 拦截/失败 {failed_cnt} 个")

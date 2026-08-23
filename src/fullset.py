@@ -45,6 +45,12 @@ try:
 except ImportError:                                          # pragma: no cover
     _blake3 = None
 
+#: blake3 在不在。缺席时哈希列整列为空——**这不是小事，调用方必须说出来**：
+#: 没有哈希的清单只剩路径，而路径是观测值不是身份，改个名这本账就对不上了。
+#: 更坏的是它看起来完整，容易被当成校验依据用（真机上就这么误用过一次：
+#: 拿空值去比对，`if 记录值 and 不相等` 短路跳过，报了一轮「全部吻合」）。
+HASHING_AVAILABLE = _blake3 is not None
+
 MANIFEST_NAME = "_manifest.csv"
 MANIFEST_FIELDS = [
     "产物相对路径", "源相对路径",
