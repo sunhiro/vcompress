@@ -119,3 +119,79 @@ pix_bit_depth('yuv420p')  == 8
 | 两侧 `fps` 归一化 + `format=yuv420p` 能修错位 | 49.51 → **46.75**，逐帧形状纹丝不动 | 2026-08-02 |
 | 「同一 QP 下窗口极差 > 20」可作为坏窗口判据 | `IMG_1933` QP24 三窗口全坏、极差仅 7.64，抓不住 | 2026-08-02 |
 | 中断是「Docker 守护进程重启」的孤立事件 | **存疑**：两次中断都在长时间 VAAPI 满载后；Apollo Lake 的 i915 挂死是已知问题。机器恢复后先查 `dmesg \| grep -iE "i915\|GPU HANG"` | 2026-08-03 |
+
+---
+
+## 怎么跑（2026-08-26 首次在本仓执行时补写）
+
+**🔴 NAS 的系统 ffmpeg 跑不了这套回归。** `/usr/bin/ffmpeg` 是 4.1.9，
+`-filters` 里只有 `vmafmotion`，**没有 `libvmaf`**。必须进 `vcat-media` 容器：
+那里是 ffmpeg N-125781（带 libvmaf）+ iHD VAAPI 驱动 25.2.3 + exiftool 13.25。
+
+样本在群晖上（`ssh inas`，需先 `tailscale up --accept-routes`；Tailscale 停了的话
+`ssh inas` 会报 `Connection closed`，不是密钥问题）。**scp 到群晖会被拒**（`Connection closed`），
+传文件用 `ssh inas 'cat > 目标' < 源`。
+
+把本仓 `src/` 推上去，挂进容器跑（这样测的是**本仓代码**，不是镜像里烤死的 `/opt/compress_videos_nas.py`）：
+
+```bash
+ssh inas 'mkdir -p /volume1/docker/vcat/vcompress-repo/src /volume1/docker/vcat/regression'
+for f in vcompress.py diag_vmaf_window.py naming.py fullset.py export_report.py; do
+  ssh inas "cat > /volume1/docker/vcat/vcompress-repo/src/$f" < "src/$f"
+done
+
+# 批量路径（R2/R3/R4/R5）
+ssh inas 'sudo -n /usr/local/bin/docker run --rm --device /dev/dri \
+  -v /volume3:/volume3 -v /volume1/docker/vcat/vcompress-repo:/repo \
+  -v /volume1/docker/vcat/regression:/reg --entrypoint python3 vcat-media \
+  -u /repo/src/vcompress.py -i /volume3 -o /reg/out-R2 --file-list /reg/list-R2.txt -e vaapi'
+
+# R1 的检查点（QP20 / QP1 对照 / 两侧帧数）要用 diag 工具，批量路径复现不出来
+ssh inas 'sudo -n /usr/local/bin/docker run --rm --device /dev/dri \
+  -v /volume3:/volume3 -v /volume1/docker/vcat/vcompress-repo:/repo \
+  --entrypoint python3 vcat-media \
+  -u /repo/src/diag_vmaf_window.py --window middle --qp 20 --control-qp 1 -e vaapi \
+  /volume3/video/1_Clips/2014/2014-07/IMG_2150.MOV \
+  /volume3/video/1_Clips/2014/2014-07/IMG_2151.MOV'
+```
+
+**为什么 R1 必须用 diag 而不是批量跑**：默认阶梯是 `28 26 24 22`，健康样本 `IMG_2150`
+在 QP26 就过闸门了，**QP20 永远走不到，近无损对照也不会触发**（只有分数低于
+`--suspect-below 80` 才触发）。R1 表里那两个数是 diag 工具直接指定 `--qp 20 --control-qp 1` 量出来的。
+
+**顺带记一条**：`IMG_2150` 时长 65.0s，而三窗口的门槛正是 `duration >= 65.0`
+（`SEEK_PREROLL(10) + 5 + 15*3 + 5`）。它**卡在边界上走单窗口路径**，所以 R1 表里
+只有一个窗口、帧数 360（15s × 24fps）。`IMG_2151` 73.2s 才是三窗口。别以为少了两个窗口是 bug。
+
+**别并发跑**：只有一块 `/dev/dri`，且 Apollo Lake 的 i915 在 VAAPI 长时间满载后挂死
+是已知问题（见「已证伪的假说」末条）。串行跑。
+
+## 最近一次执行记录
+
+| 日期 | 结果 |
+|---|---|
+| 2026-08-26 | **首次在本仓执行**（此前只在 vcat 真机上跑过，见 `REVIEW_FROM_VCAT.md`）。R1·R2·R3·R4·R6·R8 ✅ / R5 ⚠ / R7 ❌ |
+
+- **R1 ✅ 逐位复现 2026-08-02 的每一个数**：`IMG_2150` QP20=99.35、QP1 对照=99.99、帧数 360/360；
+  `IMG_2151` QP20=49.51、QP1 对照=49.57、帧数 **359/369**。
+  → RED-LINES §5「两把尺子」**依然未修**，签名原样健在。
+- **R2 ✅ 逐位复现**，含最要命的「不许放水」：QP28 三窗口 92.11/46.24/91.69 → Middle 对照
+  49.57 判不可信剔除 → 剩余 min 91.69 仍 < 93 → **老实走下一档**，没放行 →
+  QP26 拿 96.47/96.13 过闸 → 184.58MB➔68.00MB / 63.2% / VMAF 96.13 / QP26。
+- **R6 ✅** 6/6。**R8 ✅** 原片 sha256+size+mtime+inode+mode 零改动，
+  **且做了变异验证**：注入「回写原片」后被当场抓出（检查是真在锁，不是恒真）。
+  ⚠ 变异体自己全程不报错，照样打「✅ 转码成功」——这条闸只在外部校验里成立。
+- **R7 ❌ 在 NAS 侧不通过**：数据行 9 列 / 表头 8 列。见 ACTIVE_MEMORY 的缺陷 2。
+  R7 断言的「第 7 列一字不变」本身仍成立，下游 `backfill` 用 `row[:7]` 侥幸没被破。
+- **R3 ✅**：`IMG_1933` QP28 三窗口 78.64 / 17.83 / 29.33（与文档历史值一字不差），
+  报表写 `需人工检查(测量不可信: 近无损对照未过关)`，**没有出现「画质不达标」**。
+- **R4 ✅**：`VTS_01_2.VOB` 起始窗口落在 **Beginning@15s**，QP28 拿到 89.84 ——
+  没有退回 5.0s，也没出现文档说的 16.45 假低分。最终 QP24 过闸，1023.97MB➔539.71MB / 47.3%。
+- **R5 ⚠ 断言通过，但机制没被触发，文档的期望值要改**：
+  产物**有**音轨（`mp2`, 2ch），音轨没被静默丢弃 —— 这是 R5 真正要守的东西，成立。
+  但期望值写的 `aac` **对不上**：产物是 `VTS_01_2.hevc.VOB`，**沿用了源扩展名**，
+  走 MPEG-PS muxer，`-c:a copy` 直接成功，「MP4 muxer 拒收 → 退 aac 重试」那条路根本没走到。
+  → 要么把 R5 的期望值改成「产物必须有音轨（此样本为 mp2）」，
+    要么另找一个输出为 `.mp4` 的 MP2 样本才能真正验到 aac 退避路径。
+  → 另有一问待定：HEVC 封进 MPEG-PS（`.VOB`）的播放兼容性，本次未评估。
+- **R8 ✅（真机三样本）**：`IMG_2150` / `IMG_2151` / `IMG_1933` 跑完后 sha256 全部一字节未变。
