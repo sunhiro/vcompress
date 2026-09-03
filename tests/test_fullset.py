@@ -136,12 +136,38 @@ def test_plan_move_is_a_plan_only_nothing_moves(tmp_path):
     assert (src / "a.mp4").exists() and not (out / "a.mp4").exists()
 
 
-def test_unpairable_product_name_becomes_a_problem_not_a_guess(tmp_path):
-    """带标记但配不回源片名的产物 → 记进问题清单。调用方见到 problems 就整批不搬。"""
+def test_double_marked_product_still_pairs_and_does_not_block_the_batch(tmp_path):
+    """`x.hevcx.hevc.MOV` 这类古怪名字仍配得上源片，不该拦住整批搬运。
+
+    ⚠ 原本想在这里覆盖 `plan_move_untouched` 里那个 `problems.append(str(e))`
+    分支（产物名配不回源片 → 记进问题清单），**但它不可达**：
+    该分支只在 `unmarked_name` 抛 ValueError 时触发，而进入循环前已被
+    `is_marked` 过滤，`is_marked(p)` 为真 ⇒ `p.suffix == ".hevc"` 或
+    `p.stem.endswith(".hevc")` ⇒ `unmarked_name` 的两个 raise 条件都不成立。
+    20000 组随机名实测 0 个反例。
+
+    照 vcat `test_guard_codes.py` 的规矩，不可达分支**显式列名、不假装覆盖**：
+    一个名字说自己在验、断言却验着别的东西的测试，比没有这条更坏。
+    → **UNREACHABLE: fullset.plan_move_untouched 的 problems.append(str(e))**
+      （`unmarked_name` 若放宽成不抛，这条就该改成真覆盖）
+    """
     src, out = tmp_path / "s", tmp_path / "o"
     src.mkdir(); out.mkdir()
-    (out / "x.hevcx.hevc.MOV").write_bytes(b"x")     # is_marked 认得，unmarked 配得上
+    (out / "x.hevcx.hevc.MOV").write_bytes(b"x")
+    (src / "x.hevcx.MOV").write_bytes(b"x")          # 它的源片，压过了 → 不该搬
     (src / "keep.mp4").write_bytes(b"x")
     moves, problems = plan_move_untouched(src, out)
     assert [s.name for s, _ in moves] == ["keep.mp4"]
     assert problems == []
+
+
+def test_the_unreachable_guard_would_fire_if_it_were_reachable(tmp_path):
+    """既然真分支不可达，就直接锁住它依赖的那条不变式本身：
+    **`is_marked` 为真 ⇒ `unmarked_name` 必不抛**。哪天有人放宽 `unmarked_name`
+    或收紧 `is_marked`，这条会先红——那时上面那个分支就变可达了，得回去写真覆盖。"""
+    from naming import is_marked, unmarked_name
+    names = ["x.hevc.MOV", "x.hevc", "a/b.hevc.mp4", "x.hevcx.hevc.MOV",
+             ".hevc.MOV", "x.hevc.hevc.MOV", "带中文.hevc.mkv"]
+    for n in names:
+        if is_marked(n):
+            unmarked_name(n)      # 不抛即通过

@@ -43,11 +43,20 @@ def test_degenerates_only_when_the_source_is_unknown_too():
     assert pix_column(None, None) == ""
 
 
-@pytest.mark.parametrize("src,out", [("yuvj422p", "yuv420p"), ("yuv420p", ""),
-                                     ("yuv420p10le", "yuv420p10le")])
-def test_column_never_contains_a_comma(src, out):
-    """报表历史上有一路是裸 f-string 拼 CSV（vcompress.py 的缺陷 2），
-    这一列混进逗号就会把数据行挤成 9 列、下游按位取值静默丢半列。"""
+@pytest.mark.xfail(reason="vcompress.py 缺陷 2 未修：清洗该在 probe_pix_fmt 里做", strict=True)
+@pytest.mark.parametrize("src,out", [
+    # 🔴 真实威胁：新版 ffprobe 的 `-of csv=p=0` 会多吐一个尾随逗号（`yuv420p,`）。
+    # 生产引擎走 `-of json` 免疫，但 `vcompress.py` 那一路真被咬过（缺陷 2）：
+    # 数据行被挤成 9 列，`export_report` 按位取 r[7]，把 `->yuv420p` 静默丢掉。
+    ("yuv420p,", "yuv420p"), ("yuv420p", "yuv420p,"), ("yuvj422p,", "yuv420p,"),
+])
+def test_a_comma_polluted_probe_result_must_not_reach_the_column(src, out):
+    """探测结果带逗号时，这一列绝不能把逗号原样传下去。
+
+    ⚠ **当前是失败的**——`pix_column` 只做拼接，不清洗。清洗的正确位置在
+    探测函数（`probe_pix_fmt` 取第一个非空 token），那是 vcompress.py 缺陷 2
+    的修法，还没做。这条 xfail 就是那件事的锚：修好当天它会 XPASS 提醒摘掉标记。
+    """
     assert "," not in pix_column(src, out)
 
 

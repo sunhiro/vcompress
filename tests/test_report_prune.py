@@ -92,9 +92,12 @@ def test_mutation_preview_using_the_normal_predicate_is_caught():
 
 def test_mutation_dropping_nothing_at_all_is_caught():
     """变异验证：整个清理退化成 no-op（= 缺陷 1，每轮重复追加）。"""
+    def mutated(rows, targets, preview):
+        return list(rows)                       # no-op 变异体
+
     rows = [row("a.MOV", "已是高效HEVC(跳过)")]
+    assert mutated(rows, {"a.MOV"}, False) == rows      # 变异体留下这行 → 下轮再追加
     assert prune_report_rows(rows, {"a.MOV"}, preview=False) == []
-    assert rows != []          # 变异体（原样返回）会留下这行 → 下轮再追加一遍
 
 
 # ---- report_prune_targets：谁算「本轮会重新产出」 ---------------------------

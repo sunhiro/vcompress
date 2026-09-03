@@ -5,10 +5,15 @@
 > 🔴 **下次开工先读 `memory/ACTIVE_MEMORY.md` §6**（2026-09-03 那轮跨两仓修复 + 09-04 的单元套件）。
 
 ### 运维（不改代码，下次上机顺手做）
-- [ ] **对一次 Mac mini 上的引擎哈希**：本机 `src/vcompress_abav1.py` 与 Mac mini 的
-      `~/vcompress/src/vcompress_abav1.py` 必须一致。🔴 **S28 的修复是引擎与工人配对的，
-      只更一边会退回旧行为**（真机上两台曾长期对不上）。
+- [ ] 🔴 **把 Mac mini 上的引擎更到最新**（开下一批压缩前的硬前提）。
+      本仓现在是 `ac16bbc`；Mac mini 上次留痕的 md5 `14860d1f` = 本仓 **`73d3ca2`（2026-08-07）**，
+      **中间隔着 4 个提交，含 S28 全部六处修复**。若那台没更新过，它跑的是
+      「闸门拒绝发不出去、编码失败不删残片、续压不发 JSON」的旧行为 —— 而它正是**真正在产出文件**的那台。
+      🔴 **S28 的修复是引擎与工人（vcat `contrib/mac_mini_worker`）配对的，只更一边会退回旧行为。**
       在家走 NAS 中转：`ssh -o ProxyCommand="ssh inas python3 /var/services/homes/sunhiro/pipe_mac.py" mac`
+      ⚠ **别从文档里抄哈希去比对** —— 裸哈希下次提交就静默过期（`fullset.py 26ab6420`
+      过期了 12 天没人发现；2026-09-04 我还往 md5 的表里记了个 sha256，两重错，由红线复检抓出）。
+      **两边现算**：`md5 -q src/vcompress_abav1.py`。要记就记 git 提交号。
 - [ ] **清理 NAS 上的回归测试产物**：`/volume1/docker/vcat/regression/out-R*/`（~1.2GB）与 `vcompress-repo/`
 
 ### 代码
