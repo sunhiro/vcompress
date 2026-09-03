@@ -95,11 +95,17 @@ def preserve_metadata(source, target):
     """复制拍摄时间与 EXIF 标签，保持文件属性一致"""
     try:
         exif_cmd = [
-            # 🔴 `-overwrite_original` 是「写临时文件再 rename 盖回去」，在群晖
-            # 共享上那次 rename 会被回收站接住——真机上因此攒了 1010 个与产物
-            # 同名、小 1KB 左右（差的正是标签）的中间版，占 40GB。
-            # `_in_place` 直接改原文件，既不留中间版，也省掉隔着 SMB 整体重写第二遍。
-            'exiftool', '-overwrite_original_in_place',
+            # ⚠ 别改成 `-overwrite_original_in_place`。它不是「就地改」——
+            # 它写临时文件后把内容**整体拷回原文件**（官方文档：约慢 3 倍），
+            # 中途断开就留下一个**非空但损坏**的产物，而续压守卫只看「存在且非空」，
+            # 照收不误。`-overwrite_original` 走 rename，是原子的：临时文件写坏了
+            # 原产物一个字节不动。**宁可慢，不可错。**
+            #
+            # 已知代价：rename 会被群晖回收站接住，真机攒了 1010 个与产物同名、
+            # 小 1KB 左右（差的正是标签）的中间版，占 40GB。**那是清理问题，
+            # 不是正确性问题**，正解是产物先写临时名、元数据写完再 rename 就位
+            # （连带解决残片问题），不是拿原子性去换清爽。
+            'exiftool', '-overwrite_original',
             '-tagsFromFile', str(source),
             '-all:all', '-unsafe',
             '-FileCreateDate', '-FileModifyDate',
@@ -282,7 +288,18 @@ def process_file_abav1(src_path, out_path, args):
         # 不删它，下一轮的续压守卫（存在且非空 → 跳过）就会把这个**没过闸门的
         # 残片**当成压好的产物，而残片和真产物同名、外部扫描也认不出来。
         # 真机上 MVI_0046.AVI 那次 SMB 掉线走的就是这条路。
-        if out_path.exists():
+        # 🔴 删之前必须确认要删的不是源片本身。单文件模式下 out_path 原样等于
+        # `-o`，`-i x.mp4 -o x.mp4` 这种误用就会让这一刀落到原片上。
+        # 当前调用链走不到（续压守卫会先跳过，工人的 marked_name 非幂等），
+        # 但「当前走不到」不是不设防的理由——红线 1：绝不损坏原始文件。
+        same_as_source = False
+        try:
+            same_as_source = out_path.exists() and out_path.samefile(src_path)
+        except OSError:
+            same_as_source = False
+        if same_as_source:
+            logger.error(f"   [拒绝清理] 输出路径与源片是同一个文件，不动它: {out_path}")
+        elif out_path.exists():
             try:
                 out_path.unlink()
                 logger.warning(f"   [清理] 已删除未通过验证的半成品: {out_path}")
@@ -301,7 +318,9 @@ def process_file_abav1(src_path, out_path, args):
     # 那一半，于是「放行」照做、「记录」没做——2026-09-03 实测查出 46 个
     # yuvj422p 源片的产物变成 yuv420p（色度减半），账上一个字都看不出来。
     out_pix = get_video_metadata(out_path)[4] or ""
-    pix_col = f"{pix_fmt}->{out_pix}" if pix_fmt and out_pix else (pix_fmt or "")
+    # ⚠ 探不出来要写成 `源->?`，不能回落成单值——单值和「测了，没变化」长得
+    # 一模一样，那正是 ADR-027 要消灭的半条记录（账上看不出是没变还是没测出来）。
+    pix_col = f"{pix_fmt}->{out_pix or '?'}" if pix_fmt else (out_pix or "")
     if pix_fmt and out_pix and pix_fmt != out_pix:
         logger.info(f"   [像素格式变化] {pix_fmt} -> {out_pix}（已记入台账第 8 列）")
 
@@ -534,40 +553,64 @@ def main():
     if not report_csv.exists():
         with open(report_csv, 'w', encoding='utf-8', newline='') as f:
             csv.writer(f).writerow(REPORT_HEADER)
-    else:
-        # 🔴 开跑前把「本轮要处理的这些文件」的旧行清掉，之后照旧逐条追加。
+    elif args.input.is_dir():
+        # 开跑前把「本轮要重新处理」的旧行清掉，之后照旧逐条追加。
         #
         # 为什么需要：续压守卫是「产物存在且非空 → 跳过」，而**跳过类的文件根本
         # 不产出产物**，守卫拦不住，于是每轮都重走一遍并再 append 一次。真机上
         # 69 个唯一文件被写成 131 行，「已是高效HEVC(跳过)」12 个记成 51 个，
         # 而 HTML 仪表盘的 KPI 直接按行数汇总——「扫描了多少」是虚的。
-        # `--preview` 更狠：它显式绕过续压守卫，每跑一次就把整棵树重新追加一遍，
-        # 而 skill 文档的标准两趟跑法第一趟正是 --preview。
         #
-        # 为什么是「开跑前清一次」而不是「跑完统一重写」：后者一崩就什么都不剩。
-        # 这样只在启动时重写一次，跑起来仍是增量落盘，崩了已写的行还在。
-        # ⚠ 只清「本轮真会重新处理」的文件。续压跳过那条分支在写报表之前就
-        # `continue` 了，把它的行清掉就再也补不回来——而那正是「保留压缩版」
-        # 那些行，血缘登记的 --report 只认它们（load_report 按决定筛）。
-        # 这里的判据必须与下面续压守卫那行逐字一致，否则又是一处两张表分家。
+        # 🔴 **只在目录模式做**。单文件模式（工人那条路）`out_dir` 是产物的父目录，
+        # 动的是**整棵树共用的那份报表**，而这里的行键是裸文件名、树里的行键是
+        # 相对路径，根本对不上——删不掉任何行，却把整个文件重写一遍。纯风险零收益。
+        #
+        # 🔴 **`--preview` 只清它自己上一轮的 preview 行**。preview 显式绕过续压
+        # 守卫（`and not args.preview`），若照目录模式的判据走，会把**全部**旧行
+        # 当成「本轮会重跑」而清掉——包括「保留压缩版」那些行，而那正是 vcat
+        # 血缘登记 `--report` 唯一认的行（`lineage.load_report` 按决定筛）。
+        # 对一棵压完的树跑一次 preview（skill 文档标准两趟跑法的第一趟！），
+        # VMAF/CRF 与 ADR-027 刚加的第 8 列就一起没了。**这是复检当场抓出来的。**
         targets = set()
         for fp in files:
-            rel = fp.relative_to(base_dir) if args.input.is_dir() else fp.name
-            op = args.output / marked_name(rel) if args.input.is_dir() else args.output
+            rel = fp.relative_to(base_dir)
+            op = args.output / marked_name(rel)
             if op.exists() and op.stat().st_size > 0 and not args.preview:
                 continue  # 本轮会被续压守卫跳过，它的行原样留着
             targets.add(str(rel).replace(',', ' '))
+
+        def _drop(row):
+            if not row or row[0] not in targets:
+                return False
+            if args.preview:
+                # preview 唯一不能碰的是「保留压缩版」——那行带着 VMAF/CRF 与
+                # 第 8 列的实测像素格式，是 vcat 血缘登记唯一认的行，而 preview
+                # **重新生成不出来**（它写的是 PREVIEW成功）。其余各类（上一轮的
+                # PREVIEW 行、各种跳过行、闸门拒绝行）本轮都会照样再产出一遍，
+                # 清掉才不会每跑一次 preview 就把整棵树重追一遍。
+                return len(row) > 6 and row[6] != "保留压缩版"
+            return True
+
+        # 🔴 先写临时文件再 os.replace 就位。直接 open('w') 是**先截断后写**，
+        # 中途崩/掉线就把整份报表清零——而那时 except 里那句「可能出现重复行」
+        # 会把一次数据丢失说成排版瑕疵。同目录临时文件保证 replace 是同分区原子操作。
+        tmp = report_csv.with_suffix(".csv.tmp")
         try:
             with open(report_csv, encoding='utf-8-sig', newline='') as f:
-                kept = [r for r in csv.reader(f) if r and r[0] not in targets]
+                kept = [r for r in csv.reader(f) if not _drop(r)]
             if kept and kept[0] and kept[0][0] == REPORT_HEADER[0]:
                 kept = kept[1:]
-            with open(report_csv, 'w', encoding='utf-8', newline='') as f:
+            with open(tmp, 'w', encoding='utf-8', newline='') as f:
                 w = csv.writer(f)
                 w.writerow(REPORT_HEADER)
                 w.writerows(kept)
+            os.replace(tmp, report_csv)
         except OSError as e:
-            logger.warning(f"报表旧行清理失败，本轮可能出现重复行: {e}")
+            logger.warning(f"报表旧行清理未完成，原报表保持不动，本轮可能出现重复行: {e}")
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     # 内容清单（upsert）。与 _report.csv 的分工：那个是「本次跑了什么」的运行日志，
     # 这个是「这棵树里有什么」的账。追加式日志补不回漏掉的行，清单能从树上重建。
