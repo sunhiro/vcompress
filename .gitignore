@@ -22,3 +22,6 @@ scratch/
 .vscode/
 .idea/
 .claude/
+
+# 迁移前的旧实现，留在盘上作参考，不进版本库（REVIEW_FROM_VCAT.md §6）
+*.pre-migration.bak

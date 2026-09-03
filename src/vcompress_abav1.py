@@ -95,7 +95,11 @@ def preserve_metadata(source, target):
     """复制拍摄时间与 EXIF 标签，保持文件属性一致"""
     try:
         exif_cmd = [
-            'exiftool', '-overwrite_original',
+            # 🔴 `-overwrite_original` 是「写临时文件再 rename 盖回去」，在群晖
+            # 共享上那次 rename 会被回收站接住——真机上因此攒了 1010 个与产物
+            # 同名、小 1KB 左右（差的正是标签）的中间版，占 40GB。
+            # `_in_place` 直接改原文件，既不留中间版，也省掉隔着 SMB 整体重写第二遍。
+            'exiftool', '-overwrite_original_in_place',
             '-tagsFromFile', str(source),
             '-all:all', '-unsafe',
             '-FileCreateDate', '-FileModifyDate',
@@ -250,7 +254,10 @@ def process_file_abav1(src_path, out_path, args):
 
     if not search_res:
         logger.warning("   [拦截/跳过] ab-av1 质量搜索未找到达标 CRF (无法兼顾 VMAF 93 分与 20% 空间节省)。")
-        return "failed", orig_mb, 0.0, 0.0, "NA", "NA", f"未过质量门限(VMAF<{args.vmaf_min})", pix_fmt
+        # 🔴 「闸门拒了」是**素材结论**（终态，重跑还是这个结果），
+        # 「编码失败」是**机器故障**（值得重试）。两者都叫 failed，下游就只能
+        # 靠字符串匹配 detail 去猜，而 vcat 服务端 P2-44 刚花力气把这两件事分开。
+        return "quality_rejected", orig_mb, 0.0, 0.0, "NA", "NA", f"未过质量门限(VMAF<{args.vmaf_min})", pix_fmt
 
     best_crf = search_res.get("crf")
     best_vmaf = round(search_res.get("vmaf", 0.0), 2)
@@ -271,6 +278,16 @@ def process_file_abav1(src_path, out_path, args):
     ok = run_ab_av1_encode(src_path, out_path, args.encoder, best_crf, args.preset)
     if not ok or not out_path.exists():
         logger.error("   [失败] 全量编码异常终止。")
+        # 🔴 ffmpeg 是直接往最终路径写的（-y），失败时盘上留着半个文件。
+        # 不删它，下一轮的续压守卫（存在且非空 → 跳过）就会把这个**没过闸门的
+        # 残片**当成压好的产物，而残片和真产物同名、外部扫描也认不出来。
+        # 真机上 MVI_0046.AVI 那次 SMB 掉线走的就是这条路。
+        if out_path.exists():
+            try:
+                out_path.unlink()
+                logger.warning(f"   [清理] 已删除未通过验证的半成品: {out_path}")
+            except OSError as e:
+                logger.error(f"   [清理失败] 半成品仍在盘上，下轮可能被误当成产物: {out_path} ({e})")
         return "failed", orig_mb, 0.0, 0.0, best_vmaf, best_crf, "编码失败", pix_fmt
 
     new_bytes = out_path.stat().st_size
@@ -278,9 +295,19 @@ def process_file_abav1(src_path, out_path, args):
     actual_saving = round(((orig_bytes - new_bytes) / orig_bytes) * 100, 1)
 
     preserve_metadata(src_path, out_path)
+
+    # ADR-019 决策 2/3：色度/位深降级**默认放行，但一律记录**，而且记的必须是
+    # 压完后 ffprobe 实测的产物格式，不是按编码器推断的。此前这里只写了源片
+    # 那一半，于是「放行」照做、「记录」没做——2026-09-03 实测查出 46 个
+    # yuvj422p 源片的产物变成 yuv420p（色度减半），账上一个字都看不出来。
+    out_pix = get_video_metadata(out_path)[4] or ""
+    pix_col = f"{pix_fmt}->{out_pix}" if pix_fmt and out_pix else (pix_fmt or "")
+    if pix_fmt and out_pix and pix_fmt != out_pix:
+        logger.info(f"   [像素格式变化] {pix_fmt} -> {out_pix}（已记入台账第 8 列）")
+
     logger.info(f"   ✅ 转码成功! 原始 {orig_mb:.1f}MB ➔ 压缩后 {new_mb:.1f}MB (实际节省 {actual_saving}%)")
 
-    return "success", orig_mb, new_mb, actual_saving, best_vmaf, best_crf, "保留压缩版", pix_fmt
+    return "success", orig_mb, new_mb, actual_saving, best_vmaf, best_crf, "保留压缩版", pix_col
 
 def write_replace_scripts(input_dir: Path, output_dir: Path):
     """在输出目录中生成一键替换/统一合并脚本 `_apply_replace.py` 和 `_apply_replace.sh`"""
@@ -503,10 +530,44 @@ def main():
     report_xlsx = out_dir / "_report.xlsx"
     report_html = out_dir / "_report.html"
 
+    REPORT_HEADER = ['文件', '原MB', '新MB', '省%', 'VMAF', 'CRF/Q', '决定', '像素格式']
     if not report_csv.exists():
         with open(report_csv, 'w', encoding='utf-8', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow(['文件', '原MB', '新MB', '省%', 'VMAF', 'CRF/Q', '决定', '像素格式'])
+            csv.writer(f).writerow(REPORT_HEADER)
+    else:
+        # 🔴 开跑前把「本轮要处理的这些文件」的旧行清掉，之后照旧逐条追加。
+        #
+        # 为什么需要：续压守卫是「产物存在且非空 → 跳过」，而**跳过类的文件根本
+        # 不产出产物**，守卫拦不住，于是每轮都重走一遍并再 append 一次。真机上
+        # 69 个唯一文件被写成 131 行，「已是高效HEVC(跳过)」12 个记成 51 个，
+        # 而 HTML 仪表盘的 KPI 直接按行数汇总——「扫描了多少」是虚的。
+        # `--preview` 更狠：它显式绕过续压守卫，每跑一次就把整棵树重新追加一遍，
+        # 而 skill 文档的标准两趟跑法第一趟正是 --preview。
+        #
+        # 为什么是「开跑前清一次」而不是「跑完统一重写」：后者一崩就什么都不剩。
+        # 这样只在启动时重写一次，跑起来仍是增量落盘，崩了已写的行还在。
+        # ⚠ 只清「本轮真会重新处理」的文件。续压跳过那条分支在写报表之前就
+        # `continue` 了，把它的行清掉就再也补不回来——而那正是「保留压缩版」
+        # 那些行，血缘登记的 --report 只认它们（load_report 按决定筛）。
+        # 这里的判据必须与下面续压守卫那行逐字一致，否则又是一处两张表分家。
+        targets = set()
+        for fp in files:
+            rel = fp.relative_to(base_dir) if args.input.is_dir() else fp.name
+            op = args.output / marked_name(rel) if args.input.is_dir() else args.output
+            if op.exists() and op.stat().st_size > 0 and not args.preview:
+                continue  # 本轮会被续压守卫跳过，它的行原样留着
+            targets.add(str(rel).replace(',', ' '))
+        try:
+            with open(report_csv, encoding='utf-8-sig', newline='') as f:
+                kept = [r for r in csv.reader(f) if r and r[0] not in targets]
+            if kept and kept[0] and kept[0][0] == REPORT_HEADER[0]:
+                kept = kept[1:]
+            with open(report_csv, 'w', encoding='utf-8', newline='') as f:
+                w = csv.writer(f)
+                w.writerow(REPORT_HEADER)
+                w.writerows(kept)
+        except OSError as e:
+            logger.warning(f"报表旧行清理失败，本轮可能出现重复行: {e}")
 
     # 内容清单（upsert）。与 _report.csv 的分工：那个是「本次跑了什么」的运行日志，
     # 这个是「这棵树里有什么」的账。追加式日志补不回漏掉的行，清单能从树上重建。
@@ -547,6 +608,19 @@ def main():
                         encoder=args.encoder, tool="vcompress_abav1.py",
                     )
                     logger.info(f"   [补登记] 上一轮的产物补进内容清单: {dst_rel}（VMAF 本轮未测，留空）")
+            # 🔴 这条路径以前**什么都不往 stdout 写就退出 0**，于是调用方
+            # （vcat 的 mac_mini_worker）看到「退出码 0 + 无 JSON」，把它当成
+            # 「压成功了」记进终态流水账——而盘上那个文件可能是上一轮崩掉留下的
+            # 残片。沉默让调用方只能靠猜，说清楚是跳过、跳过的是哪个文件。
+            if getattr(args, 'json_out', False):
+                sys.stdout.write(json.dumps({
+                    "status": "skipped",
+                    "out_path": str(out_path),
+                    "out_size": out_path.stat().st_size,
+                    "vmaf_mean": None, "vmaf_min": None, "crf_val": None,
+                    "detail": "断点续压：产物已存在，本轮未重压也未验证",
+                }, ensure_ascii=False) + "\n")
+                sys.stdout.flush()
             continue
 
         logger.info(f"\n[{idx}/{len(files)}] 检查中: {rel_path}")
@@ -561,11 +635,16 @@ def main():
         # --json-out：向 stdout 输出一行机器可读 JSON（供 vcat compress-worker 解析）
         if getattr(args, 'json_out', False):
             out_size = int(new_mb * 1024 * 1024) if new_mb else None
+            # 🔴 老版这里是 `status.startswith("skipped")` 里面再判 `status == "failed"`
+            # ——恒假，quality_rejected 一次都没发出去过，闸门拒绝与编码失败一起
+            # 被下游当成 failed。工人那边对 failed 的处理是「记终态、不重试」，
+            # 于是**真正的机器故障永远不会被重做**。
             if status == "success":
                 json_status = "success"
+            elif status == "quality_rejected":
+                json_status = "quality_rejected"
             elif status.startswith("skipped"):
-                # 区分性价比不足（quality_rejected 语义）vs 纯跳过
-                json_status = "quality_rejected" if status == "failed" else "skipped"
+                json_status = "skipped"
             else:
                 json_status = "failed"
             result_json = {
@@ -594,7 +673,8 @@ def main():
                     vmaf=None if vmaf in ("NA", None) else vmaf,
                     encoder=args.encoder, tool="vcompress_abav1.py",
                 )
-        elif status.startswith("skipped"):
+        elif status.startswith("skipped") or status == "quality_rejected":
+            # 闸门拒了不是「失败」——素材本来就不值得压，这是正常结论
             skipped_cnt += 1
         else:
             failed_cnt += 1
