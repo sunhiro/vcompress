@@ -36,6 +36,10 @@ SUPPORTED_EXTENSIONS = {
     '.3gp', '.wmv', '.flv', '.webm', '.vob', '.mpg', '.rmvb'
 }
 
+#: 台账 CSV 的表头。🔴 **只能加列，不能改列序**——contrib/backfill_compress_report.py
+#: 按位取 row[:7]，vcat 的 lineage.load_report 按第 7 列「决定」精确匹配筛行。
+REPORT_HEADER = ['文件', '原MB', '新MB', '省%', 'VMAF', 'CRF/Q', '决定', '像素格式']
+
 def check_dependencies():
     """检查系统环境依赖 binary：ab-av1, ffmpeg, ffprobe, exiftool"""
     missing = []
@@ -211,6 +215,110 @@ def run_ab_av1_encode(input_path, output_path, encoder_name, crf_val, preset=Non
         logger.error(f"执行 FFmpeg 转码异常: {e}")
         return False
 
+def pix_column(src_pix, out_pix):
+    """台账第 8 列「像素格式」：`源->产物`（ADR-019 决策 2/3、ADR-027）。
+
+    ⚠ 产物探不出来要写 `源->?`，**不能回落成单值**——单值和「测了，没变化」
+    长得一模一样，账上就分不出「没变」还是「没测出来」，那正是 ADR-027
+    要消灭的半条记录。源片也探不出来时才退化（此时无从记变迁）。
+    """
+    if src_pix:
+        return f"{src_pix}->{out_pix or '?'}"
+    return out_pix or ""
+
+
+def json_status_for(status):
+    """内部 status → `--json-out` 对外 status（供 vcat 的工人按状态显式分派）。
+
+    🔴 四类**必须各走各的**，合并任意两类都会在下游变成记账错误：
+      - `success`          压成功
+      - `quality_rejected` 闸门拒了 —— **素材结论**，终态，重跑还是这个结果
+      - `skipped`          规则跳过 —— 终态
+      - 其余（含 failed）   **机器故障** —— 非终态，工人要删残片重做
+
+    老版是 `status.startswith("skipped")` 里面再判 `status == "failed"`（恒假），
+    于是 quality_rejected 一次都没发出去过，闸门拒绝与编码失败一起被当 failed，
+    而工人对 failed 是「记终态不重试」→ **真正的机器故障永远不会被重做**。
+    """
+    if status == "success":
+        return "success"
+    if status == "quality_rejected":
+        return "quality_rejected"
+    if status.startswith("skipped"):
+        return "skipped"
+    return "failed"
+
+
+def report_prune_targets(files, base_dir, out_root, preview):
+    """本轮会重新产出一行的源片集合（报表行键 = 相对路径，逗号换空格）。
+
+    续压守卫是「产物存在且非空 → 跳过」，而**跳过类文件根本不产出产物**，
+    守卫拦不住，于是每轮都重走一遍并再 append 一次。真机上 69 个唯一文件
+    被写成 131 行，而 HTML 仪表盘的 KPI 按行数汇总，「扫描了多少」是虚的。
+
+    `--preview` 显式绕过续压守卫，所以它眼里**每个文件本轮都会重新产出**。
+    """
+    targets = set()
+    for fp in files:
+        rel = fp.relative_to(base_dir)
+        op = out_root / marked_name(rel)
+        if op.exists() and op.stat().st_size > 0 and not preview:
+            continue  # 本轮会被续压守卫跳过，它的行原样留着
+        targets.add(str(rel).replace(',', ' '))
+    return targets
+
+
+def prune_report_rows(rows, targets, preview):
+    """从旧报表行里挑出该留下的。表头由调用方处理，这里不认表头。
+
+    🔴 **`--preview` 只清它自己上一轮的 preview 行。** preview 眼里所有文件
+    都会重跑，若照普通模式的判据走，会把**全部**旧行清掉——包括「保留压缩版」
+    那些行，而那正是 vcat 血缘登记 `--report` 唯一认的行（`lineage.load_report`
+    按决定筛）。它们带着 VMAF/CRF 与 ADR-027 加的第 8 列实测像素格式，而
+    **preview 重新生成不出来**（它写的是 `PREVIEW成功`）。对一棵压完的树跑
+    一次 preview（skill 标准两趟跑法的第一趟！）证据就没了。
+    """
+    def _drop(row):
+        if not row or row[0] not in targets:
+            return False
+        if preview:
+            # preview 唯一不能碰的是「保留压缩版」。⚠ 列数不足的畸形行也一并留下
+            # （`len(row) > 6` 不成立即不删）——那种行内容未知，静默丢掉就是
+            # 又一次「把数据丢失说成排版瑕疵」。
+            return len(row) > 6 and row[6] != "保留压缩版"
+        return True
+
+    return [row for row in rows if not _drop(row)]
+
+
+def prune_report_csv(report_csv, targets, preview):
+    """就地重写报表，只留 `prune_report_rows` 挑中的行。返回是否真的写了。
+
+    🔴 先写临时文件再 `os.replace` 就位。直接 `open('w')` 是**先截断后写**，
+    中途崩/掉线就把整份报表清零——而那时 except 里那句「可能出现重复行」
+    会把一次数据丢失说成排版瑕疵。同目录临时文件保证 replace 是同分区原子操作。
+    """
+    tmp = report_csv.with_suffix(".csv.tmp")
+    try:
+        with open(report_csv, encoding='utf-8-sig', newline='') as f:
+            kept = prune_report_rows(list(csv.reader(f)), targets, preview)
+        if kept and kept[0] and kept[0][0] == REPORT_HEADER[0]:
+            kept = kept[1:]
+        with open(tmp, 'w', encoding='utf-8', newline='') as f:
+            w = csv.writer(f)
+            w.writerow(REPORT_HEADER)
+            w.writerows(kept)
+        os.replace(tmp, report_csv)
+        return True
+    except OSError as e:
+        logger.warning(f"报表旧行清理未完成，原报表保持不动，本轮可能出现重复行: {e}")
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return False
+
+
 def process_file_abav1(src_path, out_path, args):
     """单文件处理逻辑：智能规则择优过滤 -> 评估 -> 编码 -> 元数据复制"""
     orig_bytes = src_path.stat().st_size
@@ -318,9 +426,7 @@ def process_file_abav1(src_path, out_path, args):
     # 那一半，于是「放行」照做、「记录」没做——2026-09-03 实测查出 46 个
     # yuvj422p 源片的产物变成 yuv420p（色度减半），账上一个字都看不出来。
     out_pix = get_video_metadata(out_path)[4] or ""
-    # ⚠ 探不出来要写成 `源->?`，不能回落成单值——单值和「测了，没变化」长得
-    # 一模一样，那正是 ADR-027 要消灭的半条记录（账上看不出是没变还是没测出来）。
-    pix_col = f"{pix_fmt}->{out_pix or '?'}" if pix_fmt else (out_pix or "")
+    pix_col = pix_column(pix_fmt, out_pix)     # 判据与理由见 pix_column 的 docstring
     if pix_fmt and out_pix and pix_fmt != out_pix:
         logger.info(f"   [像素格式变化] {pix_fmt} -> {out_pix}（已记入台账第 8 列）")
 
@@ -549,68 +655,24 @@ def main():
     report_xlsx = out_dir / "_report.xlsx"
     report_html = out_dir / "_report.html"
 
-    REPORT_HEADER = ['文件', '原MB', '新MB', '省%', 'VMAF', 'CRF/Q', '决定', '像素格式']
     if not report_csv.exists():
         with open(report_csv, 'w', encoding='utf-8', newline='') as f:
             csv.writer(f).writerow(REPORT_HEADER)
     elif args.input.is_dir():
         # 开跑前把「本轮要重新处理」的旧行清掉，之后照旧逐条追加。
-        #
-        # 为什么需要：续压守卫是「产物存在且非空 → 跳过」，而**跳过类的文件根本
-        # 不产出产物**，守卫拦不住，于是每轮都重走一遍并再 append 一次。真机上
-        # 69 个唯一文件被写成 131 行，「已是高效HEVC(跳过)」12 个记成 51 个，
-        # 而 HTML 仪表盘的 KPI 直接按行数汇总——「扫描了多少」是虚的。
+        # 判据与它挡住的两个事故（跳过类行每轮重复追加 / preview 抹掉血缘证据）
+        # 都写在 report_prune_targets 与 prune_report_rows 的 docstring 里，
+        # 由 tests/test_report_prune.py 锁着（含变异验证）。
         #
         # 🔴 **只在目录模式做**。单文件模式（工人那条路）`out_dir` 是产物的父目录，
-        # 动的是**整棵树共用的那份报表**，而这里的行键是裸文件名、树里的行键是
-        # 相对路径，根本对不上——删不掉任何行，却把整个文件重写一遍。纯风险零收益。
-        #
-        # 🔴 **`--preview` 只清它自己上一轮的 preview 行**。preview 显式绕过续压
-        # 守卫（`and not args.preview`），若照目录模式的判据走，会把**全部**旧行
-        # 当成「本轮会重跑」而清掉——包括「保留压缩版」那些行，而那正是 vcat
-        # 血缘登记 `--report` 唯一认的行（`lineage.load_report` 按决定筛）。
-        # 对一棵压完的树跑一次 preview（skill 文档标准两趟跑法的第一趟！），
-        # VMAF/CRF 与 ADR-027 刚加的第 8 列就一起没了。**这是复检当场抓出来的。**
-        targets = set()
-        for fp in files:
-            rel = fp.relative_to(base_dir)
-            op = args.output / marked_name(rel)
-            if op.exists() and op.stat().st_size > 0 and not args.preview:
-                continue  # 本轮会被续压守卫跳过，它的行原样留着
-            targets.add(str(rel).replace(',', ' '))
-
-        def _drop(row):
-            if not row or row[0] not in targets:
-                return False
-            if args.preview:
-                # preview 唯一不能碰的是「保留压缩版」——那行带着 VMAF/CRF 与
-                # 第 8 列的实测像素格式，是 vcat 血缘登记唯一认的行，而 preview
-                # **重新生成不出来**（它写的是 PREVIEW成功）。其余各类（上一轮的
-                # PREVIEW 行、各种跳过行、闸门拒绝行）本轮都会照样再产出一遍，
-                # 清掉才不会每跑一次 preview 就把整棵树重追一遍。
-                return len(row) > 6 and row[6] != "保留压缩版"
-            return True
-
-        # 🔴 先写临时文件再 os.replace 就位。直接 open('w') 是**先截断后写**，
-        # 中途崩/掉线就把整份报表清零——而那时 except 里那句「可能出现重复行」
-        # 会把一次数据丢失说成排版瑕疵。同目录临时文件保证 replace 是同分区原子操作。
-        tmp = report_csv.with_suffix(".csv.tmp")
-        try:
-            with open(report_csv, encoding='utf-8-sig', newline='') as f:
-                kept = [r for r in csv.reader(f) if not _drop(r)]
-            if kept and kept[0] and kept[0][0] == REPORT_HEADER[0]:
-                kept = kept[1:]
-            with open(tmp, 'w', encoding='utf-8', newline='') as f:
-                w = csv.writer(f)
-                w.writerow(REPORT_HEADER)
-                w.writerows(kept)
-            os.replace(tmp, report_csv)
-        except OSError as e:
-            logger.warning(f"报表旧行清理未完成，原报表保持不动，本轮可能出现重复行: {e}")
-            try:
-                tmp.unlink(missing_ok=True)
-            except OSError:
-                pass
+        # 动的是**整棵树共用的那份报表**，而单文件模式的行键是裸文件名、树里的
+        # 行键是相对路径，根本对不上——删不掉任何行，却把整个文件重写一遍。
+        # 纯风险零收益。
+        prune_report_csv(
+            report_csv,
+            report_prune_targets(files, base_dir, args.output, args.preview),
+            args.preview,
+        )
 
     # 内容清单（upsert）。与 _report.csv 的分工：那个是「本次跑了什么」的运行日志，
     # 这个是「这棵树里有什么」的账。追加式日志补不回漏掉的行，清单能从树上重建。
@@ -678,18 +740,9 @@ def main():
         # --json-out：向 stdout 输出一行机器可读 JSON（供 vcat compress-worker 解析）
         if getattr(args, 'json_out', False):
             out_size = int(new_mb * 1024 * 1024) if new_mb else None
-            # 🔴 老版这里是 `status.startswith("skipped")` 里面再判 `status == "failed"`
-            # ——恒假，quality_rejected 一次都没发出去过，闸门拒绝与编码失败一起
-            # 被下游当成 failed。工人那边对 failed 的处理是「记终态、不重试」，
-            # 于是**真正的机器故障永远不会被重做**。
-            if status == "success":
-                json_status = "success"
-            elif status == "quality_rejected":
-                json_status = "quality_rejected"
-            elif status.startswith("skipped"):
-                json_status = "skipped"
-            else:
-                json_status = "failed"
+            # 四类结论必须各走各的，理由见 json_status_for 的 docstring；
+            # 由 tests/test_json_status.py 锁着（含把它折回旧版的变异验证）。
+            json_status = json_status_for(status)
             result_json = {
                 "status": json_status,
                 "out_path": str(out_path) if status == "success" and out_path.exists() else None,

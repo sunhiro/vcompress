@@ -4,6 +4,10 @@ __pycache__/
 *$py.class
 *.so
 
+# 单元测试用的本地虚拟环境（pytest + openpyxl），见 docs/REGRESSION.md 末尾
+.venv/
+.pytest_cache/
+
 # ab-av1 temp files
 .ab-av1*
 *.mkv
