@@ -196,6 +196,40 @@ MP4 装不下 MP2/PCM 这类老音轨（DVD 抓轨、老相机 AVI 全是），`
 10bit 现在撞不上，只因为 **HEVC 默认跳过**、而消费级 10bit 几乎都是 HEVC。
 **这是巧合的安全，不是设计的安全**——谁加一次 `--recompress-hevc`，洞就开了。
 
+### 11.1 ⚠ 上面这段讲的是 `vcompress.py`，两个引擎在这里**不一样**（2026-09-06 补）
+
+上面「HEVC 默认跳过」对 **`vcompress.py`**（Linux / vaapi，R1~R8 跑的那个）成立：
+它 `if codec in ['hevc','h265'] and not args.recompress_hevc` **无条件跳过**，
+要重压必须显式加开关。位深守卫在那条路上是**必需**的——vaapi 的 `-vf format=nv12`
+写死 8bit 4:2:0，10bit 进去必被静默降位深。
+
+但 **`vcompress_abav1.py`**（macOS / videotoolbox，T7 与相机卡批处理走的那个）
+**没有 `--recompress-hevc` 这个开关**。它的判据是码率：
+
+```python
+if codec == 'hevc' and bitrate_mbps <= args.max_hevc_bitrate:   # 默认 30Mbps
+```
+
+也就是说 **10bit HEVC 只要码率高于 30Mbps 就会被重压，不需要任何开关**；
+而 `--skip-hdr` 默认还是 `False`。所以「HEVC 默认跳过」这条护栏在生产引擎上**并不存在**。
+
+**那它为什么还是没出事？换了个理由——`hevc_videotoolbox` 会保住 10bit。**
+
+2026-09-06 实测（Mac mini / macOS 25.6 / ffmpeg 8.1.2，照抄 `run_ab_av1_encode` 的 vt 分支）：
+
+| 源片 | 源 pix_fmt | 产物 pix_fmt |
+|---|---|---|
+| 10bit HEVC 40Mbps | `yuv420p10le` | **`yuv420p10le`** |
+| 10bit H.264 40Mbps | `yuv420p10le` | **`yuv420p10le`** |
+| MJPEG 4:2:2 | `yuvj422p` | `yuv420p`（色度减半，第 8 列记着，本节允许）|
+
+🔴 **这同样是巧合的安全**：它靠的是 ffmpeg 的格式自动协商，不是我们写的守卫。
+换编码器（x265 / svt-av1）、或谁在编码命令里加一个 `-pix_fmt yuv420p`，洞立刻开。
+`docs/REGRESSION.md` 的 **R9** 就是盯着这件事的，**产物出现 8bit 即回归**。
+
+（`-e vaapi` 已于 2026-09-06 从 `vcompress_abav1.py` 的 choices 里摘掉：那条分支
+从来没有 `-vaapi_device`，硬件编码器根本起不来。vaapi 走 `vcompress.py`。）
+
 **⚠ `format=yuv420p` 这类「测量前统一像素格式」的做法未经验证，暂不采用**：
 `yuvj -> yuv` 是全范围到有限范围的转换，**直接改动亮度**，而 VMAF 恰恰只看亮度。
 两侧对称施加是否抵消，需真机验证后再说。这与 §4 是同一类风险。

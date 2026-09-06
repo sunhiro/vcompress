@@ -17,6 +17,7 @@ from vcompress_abav1 import json_status_for
 # process_file_abav1 现有的全部内部 status → 对外 status
 REAL_STATUSES = {
     "success": "success",
+    "preview": "preview",
     "quality_rejected": "quality_rejected",
     "skipped_small_file": "skipped",
     "skipped_low_hevc": "skipped",
@@ -42,8 +43,20 @@ def test_quality_rejected_is_not_skipped():
     assert json_status_for("quality_rejected") != json_status_for("skipped_hdr")
 
 
-def test_the_four_classes_are_actually_four():
-    assert len({json_status_for(s) for s in REAL_STATUSES}) == 4
+def test_the_five_classes_are_actually_five():
+    assert len({json_status_for(s) for s in REAL_STATUSES}) == 5
+
+
+def test_preview_is_not_success():
+    """🔴 2026-09-06 加的第五类。preview「成功地评估完了」但盘上一个字节都没有；
+    顶着 success 发出去，vcat 那边只能靠 out_size 是不是 null 去猜，
+    而它猜出来的两个答案（假 done / 假 encode_failed）都是错的。"""
+    assert json_status_for("preview") != json_status_for("success")
+
+
+def test_preview_is_not_a_failure_either():
+    """它也不是机器故障——不许让工人当成「该重试」。"""
+    assert json_status_for("preview") != json_status_for("failed")
 
 
 @pytest.mark.parametrize("unknown", ["", "weird", "SUCCESS", "Skipped", "quality-rejected", "skip"])

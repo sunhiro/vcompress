@@ -1,24 +1,33 @@
 # ACTIVE_MEMORY.md — vcompress 项目记忆与当前状态
 
-> **最近更新**：2026-09-04（建单元测试套件；补记 09-03 那轮跨两仓审计整改）
-> **当前状态**：`src/vcompress_abav1.py` 是全量批处理首选引擎，**已含 2026-09-03 的
-> 六处修复**（§6）。两套测试：单元 `tests/` 93 条 ✅；真机 R1~R8 停在 2026-08-26 那次
-> （R1·R2·R3·R4·R6·R8 ✅ / R5 ⚠ / R7 ❌，见 §5）。
+> **最近更新**：2026-09-06（红线复检整改 + preview 独立 status + 群晖连通性核实）
+> **当前状态**：`src/vcompress_abav1.py` 是全量批处理首选引擎，**已含 09-03 的六处修复（§6）
+> 与 09-05 的五处修复（§7）+ 09-06 的复检整改（§8）**。两套测试：单元 `tests/`
+> **205 passed** ✅；真机 R1~R8 停在
+> 2026-08-26 那次（R1·R2·R3·R4·R6·R8 ✅ / R5 ⚠ / R7 ❌，见 §5）。
 
 ---
 
-## 0. 下一个会话从这里接手（2026-09-04）
+## 0. 下一个会话从这里接手（2026-09-06）
 
-**先读 §6**（2026-09-03 跨两仓审计整改 + 09-04 单元套件）。§5 是 08-26 的快照，
-里面「三个缺陷都没修」那句**已经过时**：缺陷 1 已修，缺陷 2/3 仍在（且只在备份引擎）。
+**先读 §8**（09-06 红线复检打回了什么、以及那条最值钱的教训），再读 §7、§6。
+⚠ **§7.7 的「14 个变异体 13 个当场被抓」是自评，已被 §8 推翻**，按 §8 的数字算。
+§5 是 08-26 的快照，里面「三个缺陷都没修」那句**已经过时**：缺陷 1 已修，
+缺陷 2/3 仍在（且只在 `vcompress.py`）。
 
-手上没有进行中的任务。`TODO.md` 待办栏已按「运维 / 代码」重排，是干净的下一步清单。
-优先级最高的两件：
+手上没有进行中的任务，工作区干净。优先级最高的三件：
 
 1. 🔴 **对一次 Mac mini 上的引擎哈希** —— S28 的修复是**引擎与工人配对的**，
-   只更一边会退回旧行为。开下一批压缩前必须做，不是可选项。
-2. **缺陷 2/3**（§5.3/5.4）—— 都只在备份引擎 `vcompress.py` 里，生产那条路免疫。
-   缺陷 2 破坏的正是 ADR-027 刚补上的第 8 列，值得修。
+   只更一边会退回旧行为。09-05 这轮又改了引擎，那台落后得更多了。
+   开下一批压缩前必须做，不是可选项。
+2. 🔴 **vcat 侧要配合改一处**（§9.1）：本仓已发 `status: "preview"`，
+   而 vcat `compress_worker.py:539` 还没有这一支，会继续落到 `encode_failed`
+   （响且安全，不污染台账，但每条 preview 都记一次假失败）。
+   **在 vcat 那个会话里加分派**，本仓这边已经完事。
+3. **`vcompress.py` 的定位**（§7.6 + §8.5）—— 09-06 查清它是 **Linux 测量基准**
+   （R1~R8 跑的就是它），不是「备份」。红线 3/10/11 的守卫**实测都不需要移植**
+   到生产引擎（§8.5），三项相关 TODO 的优先级理由要重写。
+4. **缺陷 2/3**（§5.3/5.4）—— 只在 `vcompress.py` 里。
 
 🔴 动手前先看 `CLAUDE.md` 红线 5：**台账是 vcat 的，本仓不碰。**
 🔴 改完代码**无条件跑** `.venv/bin/python -m pytest`（毫秒级）。它和真机套件分工不同：
@@ -322,3 +331,352 @@ vcat derivation import-tree --tree <压缩后目录> --src-dir <原目录> [--re
 
 **11 次变异验证 11 次全部当场被抓**（8 次引擎 + 3 次命名契约）。
 跑法与那个字节码陷阱写在 `docs/REGRESSION.md` 开头。
+
+---
+
+## 7. 2026-09-05 复查五修：把「机器坏了」从「素材压不动」里拆出来
+
+起因是一次「本项目还有什么可以优化的」的通读复查。结论不是性能，是**四条静默错账**，
+外加一条需要你拍板的定位问题（§7.6）。测试 **91 → 152 passed**，全部做了变异验证。
+
+⚠ **顺带更正**：§6.3 写的「`tests/` 93 条」与实测对不上——2026-09-05 在 HEAD（d0f295e）
+上现跑是 **91 passed + 1 skipped + 3 xfailed = 95 collected**。数字本身不影响任何结论，
+但它正是「抄下来就静默过期」的又一例：**要引就现跑一次 `pytest`，别抄。**
+
+### 7.1 A：`ab-av1 跑挂了` 一直被记成 `素材压不动` —— 终态，工人永不重试
+
+老 `run_ab_av1_search` 用 `subprocess.run(..., check=True)`，任何非零退出都抛
+`CalledProcessError` → 返回 `None` → 调用方一律记 `quality_rejected`。
+而工人对 `quality_rejected` 是「素材结论、终态、不重试」。
+
+于是 **/tmp 满、ab-av1 没装、ffmpeg 崩、读卡器过热掉 USB 总线（§4.5 真机出过）**，
+剩下整批都会被永久写成「未过质量门限(VMAF<93)」，而且没有任何人会去重跑它们。
+
+🔴 **这是 S28 修复 #1 的同一形状，只是上移了一层。** 那次修的是
+「`quality_rejected` 恒假、发不出去」；这次发现**上游根本没把两件事分开**。
+红线 2 的原话：「结果枚举里没有笼统的 `failed`」——那条红线在生产引擎的入口处就漏了。
+
+**实测（ab-av1 0.11.5，两种情形都 exit 1，判别器只在 stdout 里）**：
+
+| 情形 | exit | stdout |
+|---|---|---|
+| 文件不存在（机器故障） | 1 | **一行 JSON 都没有** |
+| 素材达不到目标（素材结论） | 1 | 末行 `{"type":"crf-search-error","message":"Failed to find a suitable crf"}` |
+
+`check=True` 在看 stdout 之前就把这个判别器抛掉了。现在 `classify_search_output()`
+归三类：`found` / `rejected`（终态）/ `broken`（可重试）。
+⚠ **拿不准一律 `broken`**：白重跑一次 ≪ 永久静默写错账且永不重试。
+
+端到端验证（拿 shell 桩替掉 ab-av1）：
+```
+崩溃桩 → {"status": "failed",           "detail": "质量搜索未跑成(机器故障)"}
+拒绝桩 → {"status": "quality_rejected", "detail": "未过质量门限(VMAF<90.0)"}
+```
+修之前两者都是后者。
+
+### 7.2 B：成功行的判据太松（修 A 时会当场引爆）
+
+老判据是「反向扫第一个带 `crf` 的行」。**中间探测行 `sample-encode-done` 同样带 crf**，
+实测一次搜索里混着 `vmaf 63.36` 和 `predicted_encode_percent 156%`（压完反而更大）
+这种没过闸门的档位。老代码只因 `crf-search-done` 恰好排在最后才碰巧正确。
+
+🔴 **修 A 的顺序陷阱**：若顺手去掉 `check=True` 而不先收紧判据，失败输出的倒数第二行
+正是那个 156% 的探测点——会拿一个没过闸门的 CRF 去压全片，并把那个 VMAF 当实测值
+写进台账。判据已改为 `type == "crf-search-done"`。
+
+### 7.3 C：产物原子落位（解法本来就写在代码注释里）
+
+ffmpeg 用 `-y` 直接写最终路径，失败靠一段 `unlink` 收尾——**可那段代码只在 python
+还活着时执行得到**，而最需要它的恰恰是进程被杀 / 断电 / SMB 掉线连带 python 一起死
+的时候。残片留在最终路径上，续压守卫（存在且非空）下一轮把它当成压好的产物。
+
+改为：编码写隐藏临时名 `.X.hevc.partial.mp4` → 元数据 → 探像素格式 → `os.replace` 就位。
+- ⚠ **标记必须插在扩展名之前**，扩展名原样留末尾——ffmpeg 按它挑 muxer（R5 那个
+  `.VOB` 产物就靠这个走 MPEG-PS）。
+- 前导点让半成品对 `fullset.walk_rel` 与 `_apply_replace.py` **结构性隐身**。
+- **连带解决**注释里记的那 1010 个群晖回收站中间版（40GB）：exiftool 的 rename
+  现在发生在隐藏临时名上。
+- 🔴 **顺手补了 `uchg` 摘挂**：`shutil.copystat` 会连 `st_flags` 一起复制，源片带
+  Finder「已锁定」时产物就继承了不可变标志，**之后任何改名都 EPERM**。
+  `fullset.apply_moves` 的注释记着同一个坑（真机 133 个微信导出视频）。做法与那边一致：
+  临时摘掉、落位后原样贴回。**这一条不补，带锁的源片会在就位这一步全批失败。**
+
+### 7.4 D：红线 2「元数据无损」以前只是一条日志
+
+`preserve_metadata()` 的返回值**被丢弃了**。exiftool 失败只打一条 `logger.error`，
+随后照样返回「保留压缩版」、照样记 success、照样进 `_manifest.csv`——而
+`_apply_replace.py` 会据此**删掉源片**，那份 EXIF 就永久没了。
+
+现在：失败即丢弃产物、原片不动、记**可重试**的 `failed`（决定 `元数据继承失败`）。
+逃生口 `--allow-metadata-loss`（**默认关**），与 `vcompress.py` 的
+`--allow-bitdepth-downgrade` 同一个形状。
+
+### 7.5 E：preview 把预估当实测记账
+
+`--preview` 的内部 status 也是 `"success"`，`new_mb` 却是 ab-av1 的**预估值**。
+老代码把两种 success 累进同一个 `total_saved_mb`，于是收尾打印「累计释放磁盘空间 X GB」
+——一个**从没发生过的释放量**。而 skill 标准两趟跑法第一趟正是 `--preview`，
+所以这个假数字每次评估都会出现，且长得跟真账一模一样（§5.5 同一形状）。
+
+同一个判断还管着另外两处，都一并修了：
+- `--json-out` 不再给一个不存在的产物报 `out_size`
+- **`_manifest.csv` 不再被 preview 覆写**：preview 绕过续压守卫，对一棵**已压完**的树
+  跑 preview 时 `out_path` 是存在的，老代码会拿本轮的**预估 VMAF** 覆写那一行，
+  给真产物盖上一个从没实测过的分数。**清单是账，账上不许出现预估值。**
+
+真机验证（对已压完的树跑 preview）：`保留压缩版` 行原样健在、清单一字未动、无残片。
+
+### 7.6 🔴 待你拍板：`vcompress.py` 的定位可能一直是反的
+
+它被叫「备份引擎」，TODO 里三项（修缺陷 2、修缺陷 3、给它铺测试）都按低优先级压着，
+理由是「生产那条路免疫」。但实测三条红线守卫的归属：
+
+| 守卫 | `vcompress.py` | `vcompress_abav1.py`（生产） |
+|---|---|---|
+| 红线 3 近无损对照 / `measurement_unreliable` | ✅ `:815` | ❌ **状态枚举里根本没有这一类** |
+| 红线 10 aac 退避 | ✅ `:847` | ❌ 直接记「编码失败」 |
+| 红线 11 位深降级默认拒绝 | ✅ `:688` | ❌ 只记录，不拒绝 |
+
+公平地说：红线 4 明写「ab-av1 正是这么做的」（无损流拷贝取窗），所以红线 5「两把尺子」
+的根因在生产路上**结构性地不存在**，红线 3 的兜底需求确实小得多。
+但 10/11 跟测量路径无关，生产引擎是裸的——而 `--skip-hdr` 默认 `False`、
+HEVC 只在 ≤30Mbps 时跳过，**10bit 高码率素材是能走进去的**。
+
+真正该决策的不是「要不要给备份引擎铺测试」，而是**「这两条守卫要不要移植进生产引擎」**。
+
+### 7.7 测试：93 → 152 条，四个新文件
+
+`test_search_classify.py`（15）· `test_atomic_placement.py`（16）·
+`test_metadata_gate.py`（8）· `test_preview_accounting.py`（22）= 61 条新增。
+
+- 夹具 `STDOUT_*` 是 **ab-av1 0.11.5 真机实跑抓下来的原样输出**，不是手写的形状。
+- `conftest.py` 新增 `bench` / `make_args` / `leftovers`：把四个外部调用 monkeypatch 掉，
+  `process_file_abav1` 的**编排逻辑**（谁失败了丢弃什么、记哪个状态、盘上留不留东西）
+  就成了毫秒级可测的纯逻辑——这轮修的四件事全在这一层。
+- 决定字符串改为**引擎导出常量**（`DECISION_KEEP` / `DECISION_SEARCH_BROKEN` /
+  `DECISION_METADATA_LOST` / `DECISION_PLACE_FAILED`），测试 import 它而不是抄副本。
+  抄一份写死的字符串去比对**等于自己跟自己核对**——d0f295e 打回过两条这样的测试。
+
+> 🔴 **下面这段自评已被 2026-09-06 的红线复检推翻，按 §8 的数字算。**
+> 当时的 14 个变异体**全部打在判据层**（提取出来的纯函数），
+> 接线层一个都没打——而 bug 恰恰住在接线里。**别照抄这个数字。**
+
+**14 个变异体，13 个当场被抓**：非零退出一律判素材结论 · 判据放宽到「带 crf 就算」 ·
+无视退出码 · preview 也算真产物 · 临时名把扩展名甩到末尾 · 临时名不带前导点 ·
+删半成品时不查是不是原片 · 就位时不摘 uchg · 丢弃 `preserve_metadata` 返回值 ·
+元数据失败不丢弃半成品 · 逃生口默认放行 · 编码失败不清残片 · 就位失败不清残片。
+
+⚠ 其中「编码失败不清残片」**第一轮是漏网的**——补了
+`test_encode_failure_leaves_nothing_behind` 才抓住。变异验证的价值正在这里：
+不做这一步，那条失败路径会一直没人管着。
+
+⚠ **第 14 个至今漏网，如实记下**：去掉「开压前先清上一轮遗留半成品」那行，整套测试照样绿。
+因为 ffmpeg 带 `-y`、夹具的 fake_encode 也一样，临时名本来就会被覆写。
+**那行是冗余防御，不是闸门**，引擎里已如实标注。别以为它锁着什么。
+
+### 7.8 这轮**没做**的
+
+- **§7.6 的移植** —— 等你拍板
+- **报表行键 `.replace(',', ' ')`** —— 跨仓契约（vcat `lineage.load_report` 按这个键配对），
+  两边一起改才安全。已进 TODO
+- **`--json-out` 的 JSON 与日志混在同一个 stdout** —— `logging.basicConfig` 挂的是
+  `StreamHandler(sys.stdout)`，而代码注释写「与 logger 写 stderr/文件分离」，**注释与实现不符**。
+  09-05 实测：工人得从 stdout 里捞那行 JSON。改动会动跨仓契约，先确认 vcat 侧怎么解析的
+- **日志散落无轮转 / `check_dependencies()` 在 argparse 之前 / `--temp-dir /tmp` 硬编码**
+  —— 三件小毛病，已进 TODO
+- **真机 R1~R8 未重跑** —— 这轮全部验证都在本机（152 条单元 + 一次真编码冒烟 +
+  ab-av1 桩的端到端）。⚠ **单元套件验「记得对不对」，R1~R8 验「测得准不准」，
+  顶替不了**。C 改动了产物落盘路径，下次上群晖建议重跑一遍 R6/R8
+
+---
+
+## 8. 2026-09-06 红线复检打回：判据锁住了，接线没有
+
+§7 那轮改完，交给 `redline-reviewer`（独立上下文，**没参与那轮对话**）复检。
+它当场演示了五个「变异全绿」，其中一个**精确还原了 §7.1 声称修好的那个 bug**：
+
+```python
+if kind == "broken":        →    if False:        # 152 条测试全绿
+```
+
+### 8.1 🔴 这轮最该记住的一条
+
+**给一个纯函数写测试，锁住的只是那个纯函数。**
+
+§7 为了可测性做了三处提取（`classify_search_output` / `counts_as_real_product` /
+`pix_column` 那一族），然后给每个提取物配了十几条测试，14 个变异体全打在它们身上，
+13 个被抓，于是宣称锁住了。**但提取这个动作本身制造了一段没人看的接线**——
+判据从此住在纯函数里，而「判据有没有被用上」住在 `main()` 和 `process_file_abav1` 里，
+那两处零覆盖。
+
+原来的 bug 从来不在「分不分得出来」，在**「分出来之后用不用」**。
+所有五条漏网都在这一层：
+
+| 漏网的变异 | 后果 |
+|---|---|
+| `if kind == "broken":` → `if False:` | 机器故障重新被记成素材结论、永不重试（**就是要修的那个 bug**）|
+| `--allow-metadata-loss` 默认改 `True` | 红线 2 的闸门退回成一条日志 |
+| `DECISION_KEEP` 改名 | vcat 一条血缘都收不到；preview 反过来把成功行**全删光** |
+| `main()` 的 preview 分支折掉 | 预估重新计入实测 |
+| `REPORT_HEADER` 前六列换序 | vcat `backfill` 按位解包，静默错位 |
+
+### 8.2 我写的两条假测试（同一个形状，仓里刚打回过一次）
+
+- `test_the_escape_hatch_is_off_by_default`：**自建一个 argparse** 再断言它的默认值。
+  `action='store_true'` 的默认永远是 False——**那条断言物理上不可能失败**，
+  且从没碰过 `main()` 的 parser。
+- `test_failure_decisions_are_all_retryable(decision)`：参数化了三次，
+  **函数体一次都没用 `decision`**，只重复断言一个常量。
+
+d0f295e 打回的就是「写死一份副本跟自己核对」，我隔一天又犯了两次。
+🔴 **判据：一条测试若不能指出「哪一行生产代码改了它会红」，它就不是测试。**
+
+### 8.3 🔴 待拍板：preview 在跨仓契约上没有落脚点
+
+vcat `src/client/vcat/compress_worker.py:264` 会同时下发 `--json-out --preview`，
+而 `:539` 是 `if out_size is None or vmaf_mean is None ... → result: "encode_failed"`。
+
+| | 本仓发什么 | vcat 记成 |
+|---|---|---|
+| §7 改之前 | `success` + **预估** out_size/VMAF | 假 `done`（给不存在的文件记了体积和分数）|
+| §7 改之后 | `success` + `out_size: null` | 假 `encode_failed`（把评估成功说成机器坏了，理由还是编的）|
+
+**两个都错。** 🔴 改的是**本仓发什么**，vcat 侧别动（红线 5：台账是 vcat 的）。
+两个方向：给 preview 一个独立 status（要 vcat 配合分派），或保留 out_size
+另加 `preview: true` 标志（vcat 不改也能先不崩）。**没定之前别用 `--preview --json-out` 跑批。**
+
+### 8.4 修了什么（195 passed，23 个变异体抓住 22）
+
+- **接线层测试** `tests/test_dispatch_wiring.py`（10 条）：三类判据真的分头处理 ·
+  `main()` 的 preview 分支 · `--json-out` 的产物体积 · 收尾日志的**数字**
+  （⚠ 初版只断言那句话在不在，变异体打「预估可释放 **0.00 GB**」照样绿）
+- **两条假测试**换成打真 parser / 真调用链的
+- `DECISION_KEEP` 真正做到单一出处（`prune_report_rows` 原先还硬编码着字面量），
+  并加断言把它钉死在跨仓字面量 `保留压缩版` 上
+- `REPORT_HEADER` 改钉**全序**，不是抽查 `[6]`/`[7]`
+- **带 uchg 的半成品删得掉了**：`discard_partial` 先摘锁再删。原先就位失败后
+  会把 `UF_IMMUTABLE` 贴回 tmp，紧接着的 unlink 必然 EPERM，**隐藏残片永久留下**
+  ——而继承 uchg 的正是「133 个微信导出视频」那批人群
+- `place_atomically` 补 samefile 守卫（`os.replace` 覆写比 unlink 更不可逆，
+  那边设防这边不设是双重标准）
+- **孤儿半成品清扫**：原子落位把残渣挪成了隐藏文件，**三本账都看不见它**。
+  若只在编码步里清，一个几 GB 的残片会因为「下一轮这个文件走了小文件/低码率/
+  已是HEVC/闸门拒绝任一条提前返回」而永久留下。现在挪到每文件循环最前面
+- **台账三色**：`export_report.py` 原先是 `保留压缩版 ? succ : skip` 二分，
+  于是三个机器故障决定与「已是高效HEVC(跳过)」**同色同标签**——引擎里刚把
+  红线 2 拆开，台账里又并回去。新增 `tag-fail`
+- `discard_partial` 那条完全静默的 `except OSError: return` 加了日志
+- `partial_path` 的 docstring 收窄：前导点只对 `walk_rel` 与 `_apply_replace.py`
+  隐身，**引擎自己的 `rglob('*')` 不跳点文件**（实测）
+
+### 8.5 顺带查清的两件事
+
+**① `vcompress.py` 是 Linux 测量基准，不是「备份」。** `docs/REGRESSION.md:171`——
+R1~R8 真机套件跑的就是它（群晖 Debian 容器，`-e vaapi`）。两个引擎是**按平台分工**，
+和 `CLAUDE.md` 里已经立过的 `src/` vs `win/` 完全一样的形状。**退役它会把回归套件弄死。**
+
+**② 红线 3/10/11 的守卫实测都不需要移植进生产引擎**，但三条成立的理由**都是"碰巧"**：
+
+| 红线 | 为什么撞不上 | 靠什么撑着（改了就塌）|
+|---|---|---|
+| 3 近无损对照 | 根因（两把尺子）在 ab-av1 上结构性不存在 | **ab-av1 的取窗设计**（R10 盯着）|
+| 10 aac 退避 | 产物沿用源容器，`-c:a copy` 装得下 | **ADR-020 的命名约定**（`test_container_contract.py` 盯着）|
+| 11 位深守卫 | `hevc_videotoolbox` 实测保住 10bit | **ffmpeg 的格式协商**（R9 盯着）|
+
+已加 `docs/REGRESSION.md` 的 **R9**（生产引擎不降位深，附 09-06 实测表）与
+**R10**（ab-av1 取窗是无损流拷贝），以及 `tests/test_container_contract.py`（23 条）。
+
+🔴 **`RED-LINES.md §11` 那句「10bit 现在撞不上，只因为 HEVC 默认跳过」推理是错的**
+——HEVC 只在 ≤30Mbps 时跳过，`--skip-hdr` 默认还是 False，10bit 高码率素材照样走进去。
+结论碰巧对（videotoolbox 保住了），但理由要改。**没动那份文件，等你拍板。**
+
+**③ `-e vaapi` 从生产引擎摘掉了**：`run_ab_av1_encode` 对 `hevc_vaapi` 落进 `else`
+分支，只给 `-q:v`，**没有 `-vaapi_device`**，硬件编码器根本起不来。
+一个「看起来支持、其实跑不了」的选项比没有更坏。vaapi 那条路 `vcompress.py` 已正确实现。
+
+### 8.6 又踩了一次字节码陷阱
+
+`docs/REGRESSION.md` 开头白纸黑字写着「跑变异验证前先删 `__pycache__`」，
+我照样踩了：`REPORT_HEADER` 换序是**等长替换**，同秒内写入+还原让 Python 认为
+`.pyc` 仍然有效，还原之后测试仍在报错。
+🔴 **变异驱动脚本现在每次变异前后都清缓存**
+（`scratchpad/mutate.py`，23 个变异体一次跑完并按层分类）。
+⚠ 同一个陷阱的另一个方向更危险：**旧 `.pyc` 被服用会让变异不生效，制造假绿**。
+
+### 8.7 剩下没做的
+
+- **§8.3 的 preview 契约** —— 等拍板
+- **`RED-LINES.md §11` 的错误推理** —— 那份文件你标了「比代码重要」，没动
+- **真机 R1~R8 未重跑**：本轮全部验证在本机（195 单元 + 真编码冒烟 + ab-av1 桩端到端 +
+  孤儿清扫冒烟）。C 改了产物落盘路径，**下次上群晖务必重跑 R5/R6/R8**
+- 一个**等价变异体**漏网（`prune_report_rows` 里用字面量替 `DECISION_KEEP`）——
+  两者语义完全相同，不是覆盖漏洞；「改名」那条变异是被抓住的
+
+
+---
+
+## 9. 2026-09-06 下半场：preview 独立 status · 红线 §11 更正 · 群晖核实
+
+### 9.1 preview 有自己的 status 了（跨仓契约，**vcat 侧待改**）
+
+`--json-out` 现在发第五类 `preview`，实测字段一律 null，预测值另放 `predicted` 块：
+
+```json
+{"status":"preview","out_path":null,"out_size":null,
+ "vmaf_mean":null,"vmaf_min":null,"crf_val":51.0,"detail":"PREVIEW成功",
+ "predicted":{"out_size":4996609,"vmaf":90.52,"saving_pct":81.7}}
+```
+
+对照真跑完那条：`status:"success"` · `out_size:5264014` · `vmaf_mean:90.52` · **无 `predicted` 块**。
+
+内部 status 也从 `"success"` 改成了 `"preview"`——让它顶着 success 走完全程，
+下游每一层都要重新判一次「这个 success 是真的吗」，而漏判一层就多一处把预估记成实测的账。
+
+🔴 **vcat 侧要加一支分派**（`src/client/vcat/compress_worker.py:539` 那个
+`out_size is None → encode_failed` 之前）。**在 vcat 那个会话里改，别从这边动**
+（红线 5：台账是 vcat 的；`~/Projects/vcat` 是 AGPL，本仓 MIT）。
+没改之前 preview 会继续被记成 `encode_failed`——**响且安全**，不会再悄悄污染台账。
+
+变异 5 个抓住 5 个。⚠ 其中「preview 内部状态退回 success」第一轮**漏网**：
+`main()` 那批测试喂的是**罐装返回值**（`process_file_abav1` 被 monkeypatch 顶掉了），
+锁不住产生罐头的那台机器。补了三条直接打 `process_file_abav1` 的才抓住。
+**这是 §8.1 那个教训的又一个变种：夹具顶掉谁，谁就没被测。**
+
+### 9.2 `RED-LINES.md §11` 补了 11.1（**上一轮我说「推理是错的」，说重了**）
+
+那句「10bit 现在撞不上，只因为 HEVC 默认跳过」对 **`vcompress.py` 是成立的**：
+它 `if codec in ['hevc','h265'] and not args.recompress_hevc` **无条件跳过**。
+真正的问题是**那段话没说自己在讲哪个引擎**——`vcompress_abav1.py` 没有
+`--recompress-hevc`，判据是码率（`bitrate_mbps <= --max-hevc-bitrate`，默认 30Mbps），
+**10bit HEVC 高码率不需要任何开关就会被重压**。
+
+已补 §11.1：分引擎讲清楚 + 09-06 的 10bit 实测表 + 指向 R9。**原文一字未删。**
+
+### 9.3 群晖：连得上，但**这轮根本不需要跑 R1~R8**
+
+- ✅ `ssh inas` 通（Tailscale 是**开着**的——§5.7 说「默认是停的」，至少今天不是）。
+  DS918+，已连续运行 25 天。容器 `vcat-media` 在，样本 `IMG_2150/2151.MOV` 在，
+  回归残留 **662M**（TODO 记的 ~1.2GB 已经小了）。
+- ⚠ **Mac mini 在 Tailscale 上离线 36 天**（`7plus-mac-mini`，last seen 36d ago）。
+  TODO 第一条「更新 Mac mini 引擎」暂时够不着那台机器。
+
+🔴 **上一轮我说「务必重跑 R5/R6/R8」，那是错的。** 查清了：
+
+| | 跑的是哪个引擎 | 我这两轮改了吗 |
+|---|---|---|
+| R1~R8（群晖容器，`-e vaapi`） | **`vcompress.py`** + `diag_vmaf_window.py` | ❌ 一个字没动 |
+| 我的全部改动 | `vcompress_abav1.py`（Mac）+ `export_report.py` | —— |
+
+而且 **`vcompress.py` 根本不 import `export_report`**（它自己拼 CSV，那正是缺陷 2）——
+推送清单里的 `export_report.py` 是**残留项**，容器里连 openpyxl 都没装，
+09-06 实测 `import openpyxl` 直接 ModuleNotFoundError。所以那份文件在群晖上从来没跑过。
+
+**结论：本轮改动在群晖侧零暴露，不需要重跑真机套件。**
+（已把最新 5 个文件推上去了，下次跑 R1~R8 时是新的。容器 python 3.13.5。）
+
+### 9.4 剩下的
+
+- **vcat 侧加 preview 分派**（§9.1）—— 在那个会话里做
+- **清 662M 回归残留** —— 在 TODO 上，删是不可逆的，等你点头
+- **Mac mini 离线 36 天** —— 引擎更新这件事得等它上线
+- 一个**等价变异体**漏网（`prune_report_rows` 用字面量替 `DECISION_KEEP`，语义相同）

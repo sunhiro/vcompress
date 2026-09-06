@@ -7,12 +7,20 @@ export_report.py - 极速将视频压缩台账导出为专业可视化 Excel (_r
 import os
 import sys
 import csv
+import re
 import json
 from pathlib import Path
 from datetime import datetime
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
+
+#: 🔴 「机器故障」类的决定 —— 台账必须与「跳过」区分开。
+#: 引擎侧的单一出处是 vcompress_abav1.DECISION_*；这里用正则匹配是因为
+#: 报表也可能来自旧版本或备份引擎 vcompress.py（它的措辞不完全一样），
+#: 而**认不出来时宁可当跳过也不能当成功**。
+FAILURE_DECISIONS_RE = re.compile(r"故障|失败|不可信|无元数据")
+
 
 def build_excel_report(csv_path, xlsx_path):
     """极速从 CSV 生成专业样式的 Excel 电子表格"""
@@ -207,6 +215,7 @@ def build_html_report(csv_path, html_path):
         .tag {{ padding: 4px 8px; border-radius: 4px; font-size: 12px; font-weight: bold; display: inline-block; }}
         .tag-succ {{ background: #d4edda; color: #155724; }}
         .tag-skip {{ background: #fff3cd; color: #856404; }}
+        .tag-fail {{ background: #f8d7da; color: #721c24; }}
     </style>
 </head>
 <body>
@@ -260,7 +269,15 @@ def build_html_report(csv_path, html_path):
 """
 
     for r in rows:
-        tag_cls = "tag-succ" if r['decision'] == '保留压缩版' else "tag-skip"
+        # 🔴 「机器故障」不许和「跳过」同色。红线 2 刚在引擎里把这两件事拆开
+        # （素材结论 vs 机器坏了），台账再并回去等于白拆——看报表的人会以为
+        # 那些文件是「不值得压」，而实际是这台机器当时坏了、该重跑。
+        if r['decision'] == '保留压缩版':
+            tag_cls = "tag-succ"
+        elif FAILURE_DECISIONS_RE.search(r['decision']):
+            tag_cls = "tag-fail"
+        else:
+            tag_cls = "tag-skip"
         new_mb_disp = f"{r['new_mb']:.1f} MB" if r['decision'] == '保留压缩版' else "-"
         saving_disp = f"{r['saving']:.1f}%" if r['decision'] == '保留压缩版' else "-"
 

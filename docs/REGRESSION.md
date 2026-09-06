@@ -135,6 +135,67 @@ pix_bit_depth('yuv420p')  == 8
 **这条要做变异验证**：故意改代码让它回写原片，确认测试当场抓出，再改回来。
 否则不知道它是真锁着还是恒真。
 
+### R9 · 生产引擎不降位深（§11，2026-09-06 新增）
+
+**为什么要有这条**：红线 11 要求「位深降级默认拒绝」，而这道守卫**只在
+`vcompress.py` 里**（`:688`），生产引擎 `vcompress_abav1.py` 一行都没有。
+红线文档给的理由是「10bit 现在撞不上，只因为 HEVC 默认跳过」——**那个推理是错的**：
+HEVC 只在 `≤ --max-hevc-bitrate`（默认 30Mbps）时跳过，10bit HEVC 高码率素材
+照样走进全量转码；而 `--skip-hdr` 默认还是 `False`。
+
+真正让它撞不上的是另一件事：**`hevc_videotoolbox` 会保住 10bit**。
+这是实测结论，不是设计保证——所以要有这条用例看着它。
+
+```bash
+# 造源片（10bit，两种编码各一个）
+ffmpeg -y -f lavfi -i "testsrc2=size=1920x1080:rate=30:duration=6" \
+       -c:v libx265 -pix_fmt yuv420p10le -b:v 40M -tag:v hvc1 src_hevc10.mp4
+ffmpeg -y -f lavfi -i "testsrc2=size=1920x1080:rate=30:duration=6" \
+       -c:v libx264 -pix_fmt yuv420p10le -b:v 40M src_h264_10.mp4
+
+# 照抄 run_ab_av1_encode 的 vt 分支
+ffmpeg -y -i src_hevc10.mp4 -map 0:v:0 -map "0:a?" -c:v hevc_videotoolbox \
+       -c:a copy -movflags +faststart -q:v 50 -tag:v hvc1 out.mp4
+
+ffprobe -v error -select_streams v:0 -show_entries stream=pix_fmt -of csv=p=0 out.mp4
+```
+
+**2026-09-06 实测（Mac mini / macOS 25.6 / ffmpeg 8.1.2）**：
+
+| 源片 | 源 pix_fmt | 产物 pix_fmt | 结论 |
+|---|---|---|---|
+| `src_hevc10.mp4` | `yuv420p10le` | **`yuv420p10le`** | ✅ 位深保住 |
+| `src_h264_10.mp4` | `yuv420p10le` | **`yuv420p10le`** | ✅ 位深保住 |
+| `src_422.mov`（mjpeg） | `yuvj422p` | `yuv420p` | 色度减半（红线 11 允许，第 8 列记着）|
+
+🔴 **产物出现 8bit 就是回归**，意味着位深守卫从「不需要」变成「必需」，
+要么补守卫、要么在编码命令里显式 `-pix_fmt`。banding 不可逆，且 **VMAF 测不出来**
+（它只看亮度），闸门一个字都不会说。
+
+⚠ 这条**换编码器要重测**：结论只对 `hevc_videotoolbox` 成立。vaapi 那条路
+（`-vf format=nv12` 写死 8bit 4:2:0）**一定会降**，那正是 `vcompress.py`
+保留位深守卫的原因；`-e vaapi` 已于 2026-09-06 从生产引擎的 choices 里摘掉。
+
+### R10 · ab-av1 的取窗是无损流拷贝（§4 + §5，2026-09-06 补记）
+
+**为什么要有这条**：红线 5「两把尺子」在 `vcompress.py` 上**当前已知未修**
+（359/369 帧的签名还在）。生产引擎 `vcompress_abav1.py` 把测量整个交给了 ab-av1，
+所以那个根因在这条路上**结构性地不存在**——但这是建立在「ab-av1 用无损流拷贝
+取窗、两侧共用同一个文件」这个上游设计上的，不是我们自己保证的。上游改了，
+我们这边一声不吭就回到两把尺子。
+
+```bash
+ab-av1 crf-search -i <样本> --encoder hevc_videotoolbox --min-vmaf 90 \
+       --sample-duration 4s --samples 1 --stdout-format json
+# 看它在 --temp-dir 下留下的样本文件名与编码方式
+```
+
+**2026-09-05 实测（ab-av1 0.11.5）**：样本落成 `<name>.sample4+120f.mkv`，
+参照侧与失真侧共用它。窗口只被确定一次 → 只有一把尺子。
+
+🔴 **若某次升级后样本变成重编码产物，红线 4 的「45 个文件跑 21 小时零通过」
+那个坑会原样回来**，且症状是「不随 QP 变化的平坦低分」，看着像画质差。
+
 ## 已证伪的假说（别再走回头路）
 
 | 假说 | 实测结果 | 日期 |
