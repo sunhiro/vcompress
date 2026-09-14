@@ -209,3 +209,13 @@ def test_a_real_run_returns_success_not_preview(bench):
     status, *_ = bench.eng.process_file_abav1(bench.src, bench.out, make_args())
     assert status == "success"
     assert bench.out.exists()
+
+
+def test_missing_src_file_returns_failed_safely(bench):
+    """源文件不存在时不崩溃，安全返回 failed。"""
+    missing_src = bench.tmp_dir / "does_not_exist.mp4"
+    status, orig_mb, new_mb, saving, vmaf, crf, decision, _pix = \
+        bench.eng.process_file_abav1(missing_src, bench.out, make_args())
+    assert status == "failed"
+    assert "源文件不存在" in decision
+

@@ -523,6 +523,10 @@ def prune_report_csv(report_csv, targets, preview):
 
 def process_file_abav1(src_path, out_path, args):
     """单文件处理逻辑：智能规则择优过滤 -> 评估 -> 编码 -> 元数据复制"""
+    if not src_path.exists():
+        logger.warning(f"   [跳过: 源文件不存在] {src_path}")
+        return "failed", 0.0, 0.0, 0.0, "NA", "NA", "源文件不存在(跳过)", ""
+
     orig_bytes = src_path.stat().st_size
     orig_mb = orig_bytes / (1024 * 1024)
 
@@ -890,7 +894,7 @@ def main():
         files = [args.input]
         base_dir = args.input.parent
     else:
-        files = [p for p in args.input.rglob('*') if p.suffix.lower() in SUPPORTED_EXTENSIONS]
+        files = [p for p in args.input.rglob('*') if p.suffix.lower() in SUPPORTED_EXTENSIONS and not p.name.startswith('._')]
         base_dir = args.input
 
     out_dir = args.output if args.output.is_dir() or not args.output.suffix else args.output.parent
@@ -936,6 +940,11 @@ def main():
 
     for idx, file_path in enumerate(files, 1):
         rel_path = file_path.relative_to(base_dir) if args.input.is_dir() else file_path.name
+        if not file_path.exists():
+            logger.warning(f"[{idx}/{len(files)}] [跳过: 源文件不存在] {rel_path}")
+            skipped_cnt += 1
+            continue
+
         # 产物带 .hevc 标记（naming.py 说明了为什么）。单文件模式下输出路径由
         # 调用方（vcat compress worker）给全，它自己已经加过标记，这里不再动。
         out_path = args.output / marked_name(rel_path) if args.input.is_dir() else args.output
