@@ -219,3 +219,25 @@ def test_missing_src_file_returns_failed_safely(bench):
     assert status == "failed"
     assert "源文件不存在" in decision
 
+
+def test_insufficient_saving_discarded_and_marked_skipped_saving(bench, monkeypatch):
+    """🔴 全量编码落地后，若实际节省率 < min_saving_pct (默认20%)，必须丢弃半成品产物且状态为 skipped_saving。"""
+    # bench 默认原片 3MB (3 * 1024 * 1024 字节)
+    # 模拟转码产物为 2.7MB (仅省 10%，低于 20% 门限)
+    def fake_encode_large(src_path, out_path, *a, **k):
+        out_path.write_bytes(b"y" * int(2.7 * 1024 * 1024))
+        return True
+
+    monkeypatch.setattr(bench.eng, "run_ab_av1_encode", fake_encode_large)
+
+    status, orig_mb, new_mb, saving, vmaf, crf, decision, _pix = \
+        bench.eng.process_file_abav1(bench.src, bench.out, make_args(min_saving_pct=20.0))
+
+    assert status == "skipped_saving"
+    assert decision == bench.eng.DECISION_SAVING_INSUFFICIENT
+    assert bench.eng.json_status_for(status) == "skipped"
+    assert not bench.out.exists()  # 产物未落位
+    # 临时文件已被清理
+    from conftest import leftovers
+    assert leftovers(bench.tmp_dir) == ["CLIP.mp4"]
+

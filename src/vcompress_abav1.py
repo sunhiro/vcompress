@@ -51,6 +51,7 @@ DECISION_KEEP = "保留压缩版"
 DECISION_SEARCH_BROKEN = "质量搜索未跑成(机器故障)"
 DECISION_METADATA_LOST = "元数据继承失败"
 DECISION_PLACE_FAILED = "产物就位失败"
+DECISION_SAVING_INSUFFICIENT = "空间节省不足(跳过 <20%)"
 
 def check_dependencies():
     """检查系统环境依赖 binary：ab-av1, ffmpeg, ffprobe, exiftool"""
@@ -652,6 +653,18 @@ def process_file_abav1(src_path, out_path, args):
     if pix_fmt and out_pix and pix_fmt != out_pix:
         logger.info(f"   [像素格式变化] {pix_fmt} -> {out_pix}（已记入台账第 8 列）")
 
+    # 实测产物真实节省率二次校验门限（全量落盘防膨胀/微小收益兜底）
+    # ab-av1 仅抽样 3 段 15s 切片预测，长视频动态场景丰富可能导致全量落地体积踩线甚至反弹
+    tmp_bytes = tmp_path.stat().st_size
+    actual_saving = round(((orig_bytes - tmp_bytes) / orig_bytes) * 100, 1)
+    if actual_saving < args.min_saving_pct:
+        logger.warning(
+            f"   [拦截/跳过] 全量编码后真实节省率 {actual_saving}% < 最低要求 {args.min_saving_pct}%"
+            f"（产物 {tmp_bytes / (1024*1024):.1f}MB vs 原片 {orig_mb:.1f}MB），产物已丢弃，保留原片。"
+        )
+        discard_partial(tmp_path, src_path, "节省空间不足的产物")
+        return "skipped_saving", orig_mb, 0.0, 0.0, best_vmaf, best_crf, DECISION_SAVING_INSUFFICIENT, pix_col
+
     # 全部校验通过，这一刻它才成为「产物」——在此之前最终路径上什么都没有。
     if not place_atomically(tmp_path, out_path):
         discard_partial(tmp_path, src_path, "未能就位的产物")
@@ -659,7 +672,6 @@ def process_file_abav1(src_path, out_path, args):
 
     new_bytes = out_path.stat().st_size
     new_mb = new_bytes / (1024 * 1024)
-    actual_saving = round(((orig_bytes - new_bytes) / orig_bytes) * 100, 1)
 
     logger.info(f"   ✅ 转码成功! 原始 {orig_mb:.1f}MB ➔ 压缩后 {new_mb:.1f}MB (实际节省 {actual_saving}%)")
 
@@ -882,15 +894,19 @@ def main():
                              '同分区 rename、秒级。🔴 默认关闭：搬运本身不减少副本数，'
                              '但前提是这些文件在别处还有备份——源目录搬空之后就不是备份了。'
                              '开之前先确认（vcat 用户可看 `vcat status --cold` 的孤本数）。')
-    # 默认不生成：这个脚本会删掉 -i 指向的源片。它的杀伤力配不上「每次跑完
-    # 都无声生成一份」的行为——尤其当 -i 是一份临时副本时，跑一下就没了。
     parser.add_argument('--emit-replace-script', action='store_true',
                         help='额外生成 _apply_replace.py/sh 人工覆盖脚本（会删除 -i 下的源片，默认不生成）')
+    parser.add_argument('--file-list', type=Path, help='仅处理指定文本文件内列出的相对路径文件（每行一个相对路径）')
     parser.add_argument('--json-out', action='store_true', help='单文件模式：处理完毕后向 stdout 输出一行 JSON 结果（供 vcat compress-worker 解析）')
 
     args = parser.parse_args()
 
-    if args.input.is_file():
+    if getattr(args, 'file_list', None) and args.file_list:
+        with open(args.file_list, 'r', encoding='utf-8') as f:
+            lines = [line.strip() for line in f if line.strip() and not line.strip().startswith('#')]
+        files = [args.input / l for l in lines]
+        base_dir = args.input
+    elif args.input.is_file():
         files = [args.input]
         base_dir = args.input.parent
     else:
