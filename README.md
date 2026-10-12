@@ -82,6 +82,36 @@ python3 src/vcompress_abav1.py \
   --vmaf-min 95.0
 ```
 
+#### 5. 大疆 / 相机卡专用备份与反向同步工作流
+1. **自动过滤相机垃圾代理与大 RAW 压制**：
+   ```bash
+   # 默认已内置 --exclude-pattern '*._*,*_LRF.*,*.lrf,*.dng'
+   python3 src/vcompress_abav1.py \
+     -i /Volumes/OsmoNano/DCIM \
+     -o /Users/sun/Movies/OsmoNano_Compressed \
+     -e vt --vmaf-min 93.0
+   ```
+2. **生成自包含全集目录（源端留冷备，小文件/照片搬入目标）**：
+   ```bash
+   # 默认过滤 .LRF/.DNG，先 Dry-Run 预演，带 --apply 真正执行
+   python3 src/merge_fullset.py \
+     -s /Volumes/OsmoNano/DCIM \
+     -d /Users/sun/Movies/OsmoNano_Compressed \
+     --mode copy --apply
+   ```
+3. **本地删片后反向同步清除 U 盘 / 相机卡已废弃素材**：
+   ```bash
+   # 默认 Dry-Run 预演，识别原名/大小写及 .hevc 压缩版，不误删保留片与 THM/SCR 索引
+   python3 src/sync_udisk_deletions.py \
+     -u /Volumes/OsmoNano/DCIM \
+     -l /Users/sun/Movies/OsmoNano_Compressed \
+     --apply
+   ```
+4. **macOS 弹窗独立监控转码/后台进度**：
+   ```bash
+   ./scripts/pop_monitor.sh vcompress_abav1.log "vcompress 转码监控"
+   ```
+
 ---
 
 ### 方式二：使用真机完整版引擎 (`vcompress.py`)

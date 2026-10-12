@@ -98,3 +98,30 @@ def test_apply_merge_move_leaves_cold_backup_only(tmp_path):
     # 源目录：只留下了被压过的 v1 原片当冷备份！v2 已被搬走
     assert (src / "v1.mp4").exists()
     assert not (src / "v2.mp4").exists()
+
+
+def test_plan_merge_excludes_camera_proxies_and_raw(tmp_path):
+    """验证 merge_fullset 能根据模式准确排除大疆 LRF 代理文件与 DNG RAW。"""
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    src.mkdir()
+    dst.mkdir()
+
+    (src / "normal_video.mp4").write_text("v")
+    (src / "DJI_0001_LRF.mov").write_text("proxy")
+    (src / "clip.LRF").write_text("proxy2")
+    (src / "photo.DNG").write_text("raw")
+    (src / "photo.JPG").write_text("pic")
+
+    plan = plan_merge(src, dst, exclude_patterns=["*._*", "*_LRF.*", "*.lrf", "*.dng"])
+
+    uv_names = [x[0] for x in plan["untouched_videos"]]
+    nv_names = [x[0] for x in plan["non_videos"]]
+    ex_names = [x[0] for x in plan["excluded_items"]]
+
+    assert "normal_video.mp4" in uv_names
+    assert "photo.JPG" in nv_names
+    assert "DJI_0001_LRF.mov" in ex_names
+    assert "clip.LRF" in ex_names
+    assert "photo.DNG" in ex_names
+

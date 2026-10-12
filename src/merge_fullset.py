@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import os
 import shutil
 import stat
@@ -27,6 +28,9 @@ SKIP_FILENAMES = {
     "_manifest.csv", "_report.csv", "_report.xlsx", "_report.html",
     ".DS_Store", ".Spotlight-V100", ".Trashes", "Thumbs.db"
 }
+
+# 默认排除的相机临时/代理/超大RAW模式（如大疆 .LRF 预览代理、.DNG RAW、AppleDouble残渣）
+DEFAULT_EXCLUDE_PATTERNS = {'*._*', '*_lrf.*', '*.lrf', '*.dng'}
 
 VIDEO_EXTS = {
     '.mp4', '.mov', '.m4v', '.avi', '.mkv', '.mts', '.m2ts',
@@ -57,11 +61,23 @@ def plan_merge(
     src_dir: Path,
     dst_dir: Path,
     videos_only: bool = False,
-    min_saving_pct: float = 20.0
+    min_saving_pct: float = 20.0,
+    exclude_patterns: set[str] | list[str] | None = None,
+    exclude_exts: set[str] | list[str] | None = None
 ) -> dict:
     """生成全集合并计划，返回分析与待处理清单。只出计划，不修改任何文件。"""
     src_files = scan_tree(src_dir)
     dst_files = scan_tree(dst_dir)
+
+    patterns = set()
+    if exclude_patterns:
+        patterns.update(p.strip().lower() for p in exclude_patterns if p.strip())
+    if exclude_exts:
+        for e in exclude_exts:
+            e = e.strip().lower()
+            if not e:
+                continue
+            patterns.add(f"*{e}" if e.startswith('.') else f"*.{e}")
 
     # 找出目标目录里所有已压缩的产物（带 .hevc 标记），并逆向映射回原文件名
     # 🔴 质量守卫：如果压缩产物实际节省率 < min_saving_pct（如 <20% 或负增长），
@@ -87,6 +103,7 @@ def plan_merge(
     untouched_videos: list[tuple[str, int]] = []
     non_videos: list[tuple[str, int]] = []
     already_in_dst: list[tuple[str, int]] = []
+    excluded_items: list[tuple[str, int]] = []
     conflicts: list[str] = []
 
     for rel_src, size in src_files.items():
@@ -94,12 +111,18 @@ def plan_merge(
         if rel_src in compressed_products:
             continue
 
+        p_src = Path(rel_src)
+        name_lower = p_src.name.lower()
+        rel_lower = str(rel_src).lower()
+        if patterns and any(fnmatch.fnmatch(name_lower, pat) or fnmatch.fnmatch(rel_lower, pat) for pat in patterns):
+            excluded_items.append((rel_src, size))
+            continue
+
         # 检查是否已在目标目录存在同名文件
         if rel_src in dst_files:
             already_in_dst.append((rel_src, size))
             continue
 
-        p_src = Path(rel_src)
         is_video = p_src.suffix.lower() in VIDEO_EXTS
 
         if is_video:
@@ -117,6 +140,7 @@ def plan_merge(
         "untouched_videos": untouched_videos,
         "non_videos": non_videos,
         "already_in_dst": already_in_dst,
+        "excluded_items": excluded_items,
         "conflicts": conflicts,
     }
     return plan
@@ -215,6 +239,11 @@ def print_plan_report(plan: dict, src_dir: Path, dst_dir: Path, mode: str):
     print("       (仅保留已经被优质压缩替代的原片，作为无损冷备份，不再掺杂任何未压片)")
     print("=" * 70)
 
+    if plan.get("excluded_items"):
+        ex_cnt = len(plan["excluded_items"])
+        ex_mb = sum(x[1] for x in plan["excluded_items"]) / (1024 * 1024)
+        print(f"\n🚫 [过滤跳过] 依规则排除文件: {ex_cnt} 个 (约 {ex_mb:.1f} MB，如 .LRF 代理或 .DNG RAW，原样保留在源端)")
+
     if plan.get("inefficient_products"):
         print(f"\n⚠️  提示: 发现 {len(plan['inefficient_products'])} 个实际节省率不足门限的低效产物 (已自动保底保留原片):")
         for prod, orig, saving in plan["inefficient_products"][:5]:
@@ -238,6 +267,10 @@ def main():
                         help="合并方式 (move=同盘秒级移动/源目录只留备份; copy=复制一份)")
     parser.add_argument("--min-saving-pct", type=float, default=20.0,
                         help="最低空间节省率门限 (默认 20.0%%，低于此值的产物不视为替代)")
+    parser.add_argument("--exclude-pattern", type=str, default="*._*,*_LRF.*,*.lrf,*.dng",
+                        help="合并时排除的文件模式 (glob)，逗号分隔 (默认: '*._*,*_LRF.*,*.lrf,*.dng'，留空可禁用)")
+    parser.add_argument("--exclude-exts", type=str, default="",
+                        help="兼容选项：按扩展名排除，逗号分隔 (如 'lrf,dng')")
     parser.add_argument("--videos-only", action="store_true",
                         help="仅合并未压缩视频，忽略非视频文件 (默认会将照片文档等全量并入全集)")
     parser.add_argument("--apply", action="store_true",
@@ -247,6 +280,9 @@ def main():
 
     args = parser.parse_args()
 
+    pats = [p.strip() for p in args.exclude_pattern.split(',') if p.strip()] if args.exclude_pattern else []
+    exts = [e.strip() for e in args.exclude_exts.split(',') if e.strip()] if args.exclude_exts else []
+
     if not args.src_dir.is_dir():
         print(f"❌ 错误: 源目录不存在: {args.src_dir}")
         sys.exit(1)
@@ -255,7 +291,14 @@ def main():
         sys.exit(1)
 
     # 1. 计划与预演分析 (Dry-run)
-    plan = plan_merge(args.src_dir, args.dst_dir, videos_only=args.videos_only, min_saving_pct=args.min_saving_pct)
+    plan = plan_merge(
+        args.src_dir,
+        args.dst_dir,
+        videos_only=args.videos_only,
+        min_saving_pct=args.min_saving_pct,
+        exclude_patterns=pats,
+        exclude_exts=exts,
+    )
     print_plan_report(plan, args.src_dir, args.dst_dir, args.mode)
 
     items_to_transfer = plan["untouched_videos"] + plan["non_videos"]

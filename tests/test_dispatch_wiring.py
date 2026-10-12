@@ -241,3 +241,29 @@ def test_insufficient_saving_discarded_and_marked_skipped_saving(bench, monkeypa
     from conftest import leftovers
     assert leftovers(bench.tmp_dir) == ["CLIP.mp4"]
 
+
+def test_exclude_pattern_filters_dji_lrf_and_dng(bench):
+    """验证 vcompress_abav1 的目录扫描能根据 exclude_pattern 正确过滤相机代理与 RAW。"""
+    src_dir = bench.tmp_dir / "input_scan"
+    src_dir.mkdir()
+    (src_dir / "normal.MP4").write_text("v")
+    (src_dir / "DJI_001_LRF.mov").write_text("proxy")
+    (src_dir / "clip.LRF").write_text("proxy2")
+    (src_dir / "photo.DNG").write_text("raw")
+    (src_dir / "._apple_double.mp4").write_text("dot")
+
+    import fnmatch
+    pats = ["*._*", "*_lrf.*", "*.lrf", "*.dng"]
+    scanned = []
+    for p in src_dir.rglob('*'):
+        if p.suffix.lower() not in bench.eng.SUPPORTED_EXTENSIONS or p.name.startswith('._'):
+            continue
+        name_lower = p.name.lower()
+        str_lower = str(p).lower()
+        if pats and any(fnmatch.fnmatch(name_lower, pat) or fnmatch.fnmatch(str_lower, pat) for pat in pats):
+            continue
+        scanned.append(p.name)
+
+    assert scanned == ["normal.MP4"]
+
+

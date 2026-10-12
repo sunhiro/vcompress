@@ -14,6 +14,7 @@ import json
 import logging
 import csv
 import stat
+import fnmatch
 import datetime as dt
 from pathlib import Path
 from export_report import build_excel_report, build_html_report
@@ -897,6 +898,8 @@ def main():
     parser.add_argument('--emit-replace-script', action='store_true',
                         help='额外生成 _apply_replace.py/sh 人工覆盖脚本（会删除 -i 下的源片，默认不生成）')
     parser.add_argument('--file-list', type=Path, help='仅处理指定文本文件内列出的相对路径文件（每行一个相对路径）')
+    parser.add_argument('--exclude-pattern', type=str, default='*._*,*_LRF.*,*.lrf,*.dng',
+                        help='扫描输入目录时跳过的文件名匹配模式 (glob)，逗号分隔 (默认: "*._*,*_LRF.*,*.lrf,*.dng"，有效跳过相机代理与残片)')
     parser.add_argument('--json-out', action='store_true', help='单文件模式：处理完毕后向 stdout 输出一行 JSON 结果（供 vcat compress-worker 解析）')
 
     args = parser.parse_args()
@@ -910,7 +913,17 @@ def main():
         files = [args.input]
         base_dir = args.input.parent
     else:
-        files = [p for p in args.input.rglob('*') if p.suffix.lower() in SUPPORTED_EXTENSIONS and not p.name.startswith('._')]
+        exclude_patterns = [p.strip().lower() for p in args.exclude_pattern.split(',') if p.strip()] if getattr(args, 'exclude_pattern', None) else []
+        scanned = []
+        for p in args.input.rglob('*'):
+            if p.suffix.lower() not in SUPPORTED_EXTENSIONS or p.name.startswith('._'):
+                continue
+            name_lower = p.name.lower()
+            str_lower = str(p).lower()
+            if exclude_patterns and any(fnmatch.fnmatch(name_lower, pat) or fnmatch.fnmatch(str_lower, pat) for pat in exclude_patterns):
+                continue
+            scanned.append(p)
+        files = scanned
         base_dir = args.input
 
     out_dir = args.output if args.output.is_dir() or not args.output.suffix else args.output.parent

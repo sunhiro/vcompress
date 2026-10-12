@@ -1,8 +1,8 @@
 # ACTIVE_MEMORY.md — vcompress 项目记忆与当前状态
 
-> **最近更新**：2026-09-16（T7 346GB实战收官：913个优质产物净省105GB + 真实节省率落盘兜底防线 + merge_fullset全集合并工具）
-> **当前状态**：`src/vcompress_abav1.py` 全流程具备「抽样预估 + 全量落地二次真实节省率门限（≥20%）」双重铁闸；
-> 单元测试 `tests/` **211 passed** ✅；新增 `src/merge_fullset.py` 支持秒级原子全集合并与源目录冷备份保留。
+> **最近更新**：2026-10-12（吸收一代目经验：大疆相机垃圾/代理文件过滤 + U盘反向同步删除 + 独立弹窗监控）
+> **当前状态**：`src/vcompress_abav1.py` 与 `src/merge_fullset.py` 支持 `--exclude-pattern`；新增 `src/sync_udisk_deletions.py` 与 `scripts/pop_monitor.sh`；
+> 单元测试 `tests/` **217 passed** ✅。
 
 ---
 
@@ -751,5 +751,33 @@ R1~R8 真机套件跑的就是它（群晖 Debian 容器，`-e vaapi`）。两�
   3. **合并工具双重守卫（`src/merge_fullset.py`）**：
      - 在全集计划制定 `plan_merge` 时，比对目标目录产物与源文件体积。若发现产物节省率不足 20%，自动报警并视为无效替代，确保原片作为未压缩素材并入全集，绝对不丢失原片。
   4. **测试覆盖**：新增接线单元测试与合并保护测试，套件通过数提升至 **211 passed** ✅。
+
+---
+
+## 11. 2026-10-12 吸收一代目实战经验：大疆相机工作流移植与 U 盘反向同步删除
+
+### 11.1 相机低清代理与大 RAW 文件智能过滤
+- **实战背景**：在早期一代目（`video-compress-gen1`）与大疆 Osmo Nano 卡实测中，机身会产生大量 `.LRF` 低分辨率预览代理视频（如 `DJI_xxx_LRF.mov`，占用 7.6GB）以及小底相机的 `.DNG` RAW 原片（占用 4.5GB），这些文件进入 VMAF 搜索会浪费算力且毫无压缩价值。
+- **改进落地**：
+  1. `src/vcompress_abav1.py`：新增 `--exclude-pattern` 参数（默认 `*._*,*_LRF.*,*.lrf,*.dng`），在文件扫描阶段自动排除相机代理、大 RAW 及 AppleDouble 残渣。强制采用大小写归一化匹配，跨平台（Mac/Linux）完全免疫大小写问题。
+  2. `src/merge_fullset.py`：引入模式排除机制，默认同步排除这些文件，防止生成最终全集目录时将相机垃圾代理重新拷入。
+  3. 配套测试：`test_exclude_pattern_filters_dji_lrf_and_dng` 与 `test_plan_merge_excludes_camera_proxies_and_raw`。
+
+### 11.2 U 盘 / 相机卡反向同步删除工具（`src/sync_udisk_deletions.py`）
+- **实战背景**：用户将相机卡/U 盘素材传输至 Mac 本地并在本地进行筛选、剪辑删片或转码后，需要一键反向清理卡内已废弃素材以释放物理硬件容量。
+- **安全防线与工程化重构**：
+  1. **Dry-Run 预演优先**：默认仅输出分析报告与释放容量预估，必须附加 `--apply` 并二次输入 `yes` 确认方才执行 `unlink`。
+  2. **相机关键文件绝对保护**：自动识别机内元数据与缩略图文件（`.thm`、`.scr`、`.db`、`.dat`、`.ctg` 等），默认跳过保护；默认保护 `.LRF` 文件供机身回放（可通过 `--purge-lrf` 显式清除）。
+  3. **产物标记与大小写鲁棒识别**：本地无论是原名、大小写不敏感匹配，还是二代带有 `.hevc` 产物标记（如 `DJI_001.hevc.MP4`），均判定为“本地已保留”，绝不误删。
+  4. **路径层级容错**：自动对齐 `DCIM/` 等相机标准父目录层级偏差。
+  5. **安全熔断机制**：若检测到本地基准目录为空或文件数为 0，强制中止执行，彻底防止因配置路径错误导致卡内文件被误清空。
+  6. 配套测试：`test_sync_udisk_deletions.py`（4 个测试用例，覆盖预演、产物匹配、DCIM 对齐与物理删除）。
+
+### 11.3 macOS 独立弹窗监控工具（`scripts/pop_monitor.sh`）
+- 移植一代目 AppleScript 终端自动调起逻辑，默认优先选择 `iTerm2`（备选 `Terminal.app`），自动将日志路径解析为绝对路径，防止新开终端因当前目录在 `$HOME` 找不到日志。
+
+### 11.4 单元测试升级
+- 全套单元测试升至 **217 passed, 1 skipped, 3 xfailed** ✅。
+
 
 
