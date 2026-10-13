@@ -36,12 +36,23 @@ Most batch compression scripts use a **fixed CRF value** (e.g. CRF 22 across the
 ### ⚡ Key Highlights
 - **Binary Search Tuning**: No more guessing CRF. The binary search algorithm finds the sweet spot in seconds.
 - **Hardware Acceleration**:
-  - **Apple Silicon (`-e vt`)**: Native `hevc_videotoolbox` hardware encoding at **7x–15x realtime speed**.
+  - **Apple Silicon (`-e vt`)**: Native `hevc_videotoolbox` hardware encoding at **7x–15x realtime speed** (Supports all M-series: **M1 / M2 / M3 / M4 / Pro / Max / Ultra**).
   - **Intel QuickSync / NAS (`-e vaapi`)**: Hardware transcoding for Linux / Synology NAS.
-  - **Next-Gen AV1 (`-e svt-av1`)**: Future-proof compression.
+  - **CPU Software Encoding (`-e x265`)**: Universal compatibility across any PC or cloud server.
+  - **Next-Gen AV1 (`-e svt-av1`)**: Future-proof compression for high-efficiency archiving.
 - **100% EXIF & Date Preservation**: Copies `FileCreateDate`, `CreationDate`, and camera EXIF tags using `exiftool`. Timelines in Apple Photos, Immich, or Synology Photos will **never be corrupted**.
 - **Interactive Visual Reporting**: Outputs incremental CSV, styled Excel spreadsheets (`.xlsx`), and a standalone Web dashboard (`.html`) featuring search, KPI cards, and sortable tables.
 - **AI Agent & LLM Friendly**: Zero interactive prompts required. Clean CLI design with JSON progress logs makes it straightforward for AI assistants (like Claude, Cursor, ChatGPT, Gemini) to automate and supervise overnight tasks.
+
+### 🖥️ Hardware Compatibility Matrix
+
+| Hardware Platform | Support | Encoder (`-e`) | Notes / Performance |
+|---|:---:|---|---|
+| **Apple Silicon (M1 / M2 / M3 / M4)** | 🌟 **Best** | `-e vt` | **7x–15x realtime speed**, silent, lowest power draw. |
+| **Intel Mac (Older macOS)** | ✅ Full | `-e vt` | Uses VideoToolbox with Intel QuickSync. |
+| **Synology / Linux NAS (Intel iGPU)** | ✅ Full | `-e vaapi` | Native VAAPI hardware transcoding without pinning CPU. |
+| **Standard Linux / Cloud Server** | ✅ Full | `-e x265` / `-e svt-av1` | Universal CPU encoding. Slower but highest efficiency. |
+| **Windows PC** | ✅ Full | See `win/` or `-e x265` | Supported via standalone scripts in `win/` or pure Python. |
 
 ---
 
@@ -101,6 +112,18 @@ You can directly instruct your AI coding assistant (Cursor / Claude / Copilot):
    调用 `exiftool` 无损复制 `FileCreateDate`、`CreationDate` 与相机元数据。导入 Apple Photos、群晖 Photos、Immich 等相册软件时，**时间线完全不错乱**。
 4. **AI 友好，极易通过 AI Agent 自动化下发**：
    全自动化流程，无任何交互弹窗打断，输出结构化 JSON 与 CSV。可让 Cursor、Claude Code 等 AI 助手直接接管通宵跑批。
+
+### 🖥️ 硬件兼容性与机型支持矩阵
+
+无论你使用的是最新款 Mac、还是群晖 NAS 或普通 PC，`vcompress` 均提供对应的高效转码路径：
+
+| 设备类型 / 硬件平台 | 推荐指数 | 对应编码器参数 (`-e`) | 说明与实测表现 |
+|---|:---:|---|---|
+| **Apple Silicon (M1 / M2 / M3 / M4 全系列)** | 🌟 **最佳体验** | `-e vt` (`hevc_videotoolbox`) | **7~15 倍实时速度**，不挑机型（M1 到 M4 均享满血硬编），发热极低、静音省电。 |
+| **Intel 芯片老款 Mac** | ✅ **完全支持** | `-e vt` | 自动调用 Intel QuickSync 核显硬件加速。 |
+| **群晖 / Linux NAS (带 Intel 核显)** | ✅ **完全支持** | `-e vaapi` | Linux / 群晖原生 VAAPI 核显加速，比 CPU 软压快 20+ 倍且绝不卡死 NAS 服务。 |
+| **通用 Linux / 云服务器** | ✅ **完全支持** | `-e x265` 或 `-e svt-av1` | 纯 CPU 算力压制，速度稍慢但具备工业级极致极限压缩率。 |
+| **Windows PC** | ✅ **完全支持** | 见 `win/` 工具或 `-e x265` | 支持 `win/` 目录下的专用 SSIM 引擎或纯 Python 跨平台运行。 |
 
 ---
 
