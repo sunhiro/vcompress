@@ -40,9 +40,14 @@ Unlike conventional encoders that blindly re-encode videos with fixed parameters
 
 ### Quick Start
 
-#### Prerequisites
+#### Installation (macOS via Homebrew - Recommended)
 ```bash
-# macOS (Homebrew)
+# One-line install (automatically pulls FFmpeg, ExifTool, ab-av1 and vcompress)
+brew install sunhiro/tap/vcompress
+```
+
+Alternatively, run from source:
+```bash
 brew install ffmpeg exiftool ab-av1
 pip3 install openpyxl
 ```
@@ -97,10 +102,15 @@ python3 src/export_report.py /path/to/compressed_videos
 6. **生产级安全防护**：
    - 原片零改动、支持断点续压、自动隔离 iPhone `mebx` 沉浸数据轨防止封装闪退。
 
-### 快速安装与依赖
+### 快速安装（推荐 macOS Homebrew 一键安装）
 
 ```bash
-# macOS
+# 一键安装（自动安装依赖 FFmpeg, ExifTool, ab-av1 与 vcompress 命令）
+brew install sunhiro/tap/vcompress
+```
+
+也可以选择从源码运行：
+```bash
 brew install ffmpeg exiftool ab-av1
 pip3 install openpyxl
 ```
