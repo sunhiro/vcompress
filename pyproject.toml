@@ -1,0 +1,57 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vcompress"
+version = "1.0.0"
+description = "Smart hardware-accelerated batch video compression engine with binary search CRF tuning & Netflix VMAF quality gates"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [
+    { name = "sunhiro" }
+]
+keywords = [
+    "video-compression",
+    "vmaf",
+    "ffmpeg",
+    "binary-search",
+    "hardware-acceleration",
+    "videotoolbox",
+    "vaapi",
+    "exiftool"
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Topic :: Multimedia :: Video :: Conversion",
+]
+dependencies = [
+    "openpyxl>=3.0.0"
+]
+
+[project.urls]
+Homepage = "https://github.com/sunhiro/vcompress"
+Issues = "https://github.com/sunhiro/vcompress/issues"
+
+[project.scripts]
+vcompress = "vcompress_abav1:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+py-modules = [
+    "vcompress_abav1",
+    "vcompress",
+    "export_report",
+    "naming",
+    "fullset",
+    "diag_vmaf_window",
+    "hot_folder_worker"
+]

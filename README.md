@@ -56,13 +56,29 @@ Most batch compression scripts use a **fixed CRF value** (e.g. CRF 22 across the
 
 ---
 
-### 🚀 Quick Start (macOS Homebrew)
+### 🚀 Quick Start & Installation
 
-#### 1. One-Line Installation
+#### Option 1: macOS via Homebrew (Recommended for Mac)
 ```bash
+# One-line install: automatically sets up FFmpeg, ExifTool, ab-av1, and vcompress
 brew install sunhiro/tap/vcompress
 ```
-*(Homebrew automatically installs FFmpeg, ExifTool, ab-av1, and python dependencies for you!)*
+
+#### Option 2: Docker / Synology NAS (Zero dependencies on host)
+```bash
+# Pull and run directly on NAS / Linux with Intel VAAPI hardware acceleration
+docker run --rm --device /dev/dri \
+  -v /volume1/videos:/data/in \
+  -v /volume1/compressed:/data/out \
+  ghcr.io/sunhiro/vcompress:latest \
+  -i /data/in -o /data/out -e vaapi
+```
+
+#### Option 3: Python Pip / Git (Cross-Platform)
+```bash
+# Install directly from GitHub
+pip install git+https://github.com/sunhiro/vcompress.git
+```
 
 #### 2. Usage Examples
 
@@ -127,15 +143,29 @@ You can directly instruct your AI coding assistant (Cursor / Claude / Copilot):
 
 ---
 
-### 🚀 快速安装（macOS Homebrew 推荐）
+### 🚀 快速安装方式
 
-只需终端一行命令（自动安装全部底层依赖 FFmpeg、ExifTool、ab-av1）：
-
+#### 方式一：macOS Homebrew 一键安装（苹果用户首选推荐）
+只需终端一行命令（自动安装全部底层依赖 FFmpeg、ExifTool、ab-av1 与 vcompress 命令）：
 ```bash
 brew install sunhiro/tap/vcompress
 ```
 
-*(也可以通过源码直接运行：`brew install ffmpeg exiftool ab-av1 && pip3 install openpyxl`)*
+#### 方式二：Docker / 群晖 NAS 容器运行（零环境污染，免装依赖）
+镜像内已预装好完整版 FFmpeg、VAAPI 驱动、ExifTool 与 ab-av1：
+```bash
+# 群晖/Linux 下利用 Intel 核显硬解硬编：
+docker run --rm --device /dev/dri \
+  -v /volume1/video:/data/in \
+  -v /volume1/video-compressed:/data/out \
+  ghcr.io/sunhiro/vcompress:latest \
+  -i /data/in -o /data/out -e vaapi
+```
+
+#### 方式三：Python pip / git 跨平台安装
+```bash
+pip install git+https://github.com/sunhiro/vcompress.git
+```
 
 ---
 
