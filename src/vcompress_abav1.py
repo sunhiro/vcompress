@@ -609,7 +609,6 @@ python3 _apply_replace.py "$@"
     logger.info(f"一键覆盖合并脚本已自动生成: {sh_script_path} (及 {py_script_path})")
 
 def main():
-    check_dependencies()
     parser = argparse.ArgumentParser(description="vcompress_abav1 - 高性价比择优视频压缩与 VMAF 质量搜索引擎 (支持多线程高性能模式及台账自动导出)")
     parser.add_argument('-i', '--input', required=True, type=Path, help='输入文件或源目录')
     parser.add_argument('-o', '--output', required=True, type=Path, help='输出文件或目标目录')
@@ -641,6 +640,7 @@ def main():
     parser.add_argument('--json-out', action='store_true', help='单文件模式：处理完毕后向 stdout 输出一行 JSON 结果（供 vcat compress-worker 解析）')
 
     args = parser.parse_args()
+    check_dependencies()
 
     if args.input.is_file():
         files = [args.input]
