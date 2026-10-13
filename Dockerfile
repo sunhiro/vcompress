@@ -13,7 +13,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libimage-exiftool-perl \
     va-driver-all \
     i965-va-driver \
-    intel-media-va-driver-non-free \
+    intel-media-va-driver \
     mesa-va-drivers \
     curl \
     ca-certificates \
