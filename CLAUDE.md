@@ -1,0 +1,64 @@
+# CLAUDE.md — vcompress 项目宪法与 AI 协作规范
+
+> 你是本项目的 AI 研发协作者。无论你是哪个模型 / 哪个终端 / 哪次会话，**先读完本文件，再读 `memory/ACTIVE_MEMORY.md`**，即可接手本项目的开发与评审。
+
+## 这是什么项目
+
+**vcompress** —— 硬件加速与 VMAF 画质拦截保障的专业视频压缩引擎。
+
+- **一句话价值**：为大容量外接硬盘/NAS 提供**“高压缩比 + 视觉无损 + 自动撤销拦截”**的可靠视频压缩服务。
+- **项目由来**：从 `nas` 仓库和 `vcat` 项目中解耦独立，作为**专一、高效、独立维护**的转码/评分核心引擎。
+- **与 `vcat` 的关系**：`vcompress` 专注于视频底层转码、元数据保护与 VMAF 计算；`vcat` 为资产台账管理大脑，未来可调用 `vcompress` 作为 worker 模块。
+- **与 `varchive` 的关系**：`varchive` 是家庭影像最终归档工程，
+  是本项目与 `vcat` 的**母项目**——两者都是从那条主线上衍生出去的工具。T7 批压缩属于它的"移动盘线"。
+
+## 🔴 两套引擎，按平台分工（2026-08-13 起，别再合并或退役其一）
+
+| | `src/`（本体） | `win/` |
+|---|---|---|
+| 平台 | **macOS** | **Windows** |
+| ffmpeg | 完整 ffmpeg + ab-av1 | digiKam 自带，**`--disable-libvmaf`，跑不了 VMAF** |
+| 质量评分 | **VMAF** 二分查找 | **SSIM / PSNR** |
+| 接入 | Mac 上跑 T7 批处理 | `bin\{compress,compare,sort}-video.cmd`、yazi `\` 菜单、用户级 skill `video-compress` |
+
+`win/` 是 2026-08-13 从 `nas` 仓的 `video/` 迁入的。此前"从 nas 解耦独立"**只做了一半**：
+旧那套一直活着且是 Windows 侧唯一入口，两边谁也没指认谁，每个新会话都要重新纠结一遍。
+**详细分工理由与 Windows 侧的评分坑见 `win/CLAUDE.md`**（触及该目录时 harness 自动加载）。
+
+---
+
+## 核心技术原则与红线
+
+1. **绝对不得损坏或静默覆写原始文件**：所有压缩产物必须输出到指定目标路径，在校验 VMAF 及体积之前，不得抹除源文件。
+2. **元数据无损原则**：压缩产物必须继承原文件的 Exif、创建时间 (`FileCreateDate`)、修改时间与音轨布局。
+3. **评分精准度高于一切**：VMAF 滤镜链必须严格保持 `trim -> setpts -> fps=30 -> format=yuv420p` 的时间轴对齐规则，绝不使用前置 `-ss` 做模糊 Seek 比对，防止串帧/假低分。
+4. **小文件保护**：单文件体积低于阈值（如 `<100MB`）默认不强行重压，节约计算资源。
+5. **🔴 台账是 `vcat` 的，本仓不碰**：vcompress 只管转码、元数据、VMAF 测量与闸门、产物完整性。
+   「这棵树里有什么 / 一共省了多少 / 哪个产物对应哪个原片」属于台账与血缘，是 `vcat` 的活。
+   **别拿一次性脚本解析 `_report.csv` 去算总账**——那份文件是「本次跑了什么」的追加式运行日志，
+   跳过类的行每轮重跑都会重复追加（实测 69 个文件写成 131 行），拿它当账必然算错。
+   要算一棵树的账用 `vcat derivation import-tree`，且在 vcat 那个会话里跑
+   （`~/Projects/vcat` 是 AGPL，本仓 MIT）。详见 `memory/ACTIVE_MEMORY.md` §5.5.1。
+
+---
+
+## 快速开发与测试命令
+
+- 依赖检查：
+  ```bash
+  brew install ffmpeg exiftool
+  ```
+- 运行测试压缩：
+  ```bash
+  python3 src/vcompress.py -i <input> -o <output>
+  ```
+- 语法检查：
+  ```bash
+  python3 -m py_compile src/vcompress.py
+  ```
+
+---
+
+## 记忆与变更规范
+
+- `memory/ACTIVE_MEMORY.md` —— **必读必写**。记录当前代码版本、最新架构重构细节、已修正的 bug 以及留给下一个 AI 评审的要点。

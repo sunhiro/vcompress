@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# 单元测试用的本地虚拟环境（pytest + openpyxl），见 docs/REGRESSION.md 末尾
+.venv/
+.pytest_cache/
+
+# ab-av1 temp files
+.ab-av1*
+*.mkv
+*.hevc_videotoolbox.*
+
+# Logs & Temporary Files
+*.log
+vcompress.log
+vcompress_abav1.log
+output/
+temp/
+scratch/
+
+# OS / IDE
+.DS_Store
+.vscode/
+.idea/
+.claude/
+
+# 迁移前的旧实现，留在盘上作参考，不进版本库（REVIEW_FROM_VCAT.md §6）
+*.pre-migration.bak
+
+# 本地私有文件、环境与个人运维备忘（绝不进版本库，多终端互不干扰）
+.env*
+*.local.*
+*.local.md
+local/
+private/
+memory/
