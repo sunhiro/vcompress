@@ -14,6 +14,7 @@ import argparse
 import json
 import logging
 import csv
+import fnmatch
 import datetime as dt
 from pathlib import Path
 from export_report import build_excel_report, build_html_report
@@ -784,6 +785,19 @@ def process_file_abav1(src_path, out_path, args):
     new_mb = new_bytes / (1024 * 1024)
     actual_saving = round(((orig_bytes - new_bytes) / orig_bytes) * 100, 1)
 
+    # 实测产物真实节省率二次校验门限（全量落盘防膨胀/微小收益兜底）
+    # ab-av1 仅抽样 3 段 15s 切片预测，长视频动态场景丰富可能导致全量落地体积踩线甚至反弹
+    if actual_saving < args.min_saving_pct:
+        logger.warning(
+            f"   [拦截/跳过] 全量编码后真实节省率 {actual_saving}% < 最低要求 {args.min_saving_pct}%"
+            f"（产物 {new_mb:.1f}MB vs 原片 {orig_mb:.1f}MB），产物已丢弃，保留原片。"
+        )
+        try:
+            out_path.unlink()
+        except OSError as e:
+            logger.error(f"   [清理失败] 节省空间不足的产物删除失败: {out_path} ({e})")
+        return "skipped_saving", orig_mb, 0.0, 0.0, best_vmaf, best_crf, "空间节省不足(跳过 <20%)", pix_fmt
+
     preserve_metadata(src_path, out_path)
 
     # ADR-019 决策 2/3：色度/位深降级**默认放行，但一律记录**，而且记的必须是
@@ -1009,6 +1023,8 @@ def main():
     # 都无声生成一份」的行为——尤其当 -i 是一份临时副本时，跑一下就没了。
     parser.add_argument('--emit-replace-script', action='store_true',
                         help='额外生成 _apply_replace.py/sh 人工覆盖脚本（会删除 -i 下的源片，默认不生成）')
+    parser.add_argument('--exclude-pattern', type=str, default='*._*,*_LRF.*,*.lrf,*.dng',
+                        help='通配符排除文件模式列表（逗号分隔，默认排除 AppleDouble 残渣、相机低清代理 LRF 及 RAW DNG）')
     parser.add_argument('--json-out', action='store_true', help='单文件模式：处理完毕后向 stdout 输出一行 JSON 结果（供 vcat compress-worker 解析）')
 
     args = parser.parse_args()
@@ -1018,7 +1034,15 @@ def main():
         files = [args.input]
         base_dir = args.input.parent
     else:
-        files = [p for p in args.input.rglob('*') if p.suffix.lower() in SUPPORTED_EXTENSIONS]
+        exclude_patterns = [p.strip().lower() for p in args.exclude_pattern.split(',') if p.strip()] if getattr(args, 'exclude_pattern', None) else []
+        all_candidates = [p for p in args.input.rglob('*') if p.suffix.lower() in SUPPORTED_EXTENSIONS and not p.name.startswith('._')]
+        files = []
+        for p in all_candidates:
+            name_lower = p.name.lower()
+            str_lower = str(p).lower()
+            if exclude_patterns and any(fnmatch.fnmatch(name_lower, pat) or fnmatch.fnmatch(str_lower, pat) for pat in exclude_patterns):
+                continue
+            files.append(p)
         base_dir = args.input
 
     out_dir = args.output if args.output.is_dir() or not args.output.suffix else args.output.parent

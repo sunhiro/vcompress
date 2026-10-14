@@ -52,6 +52,8 @@ py-modules = [
     "export_report",
     "naming",
     "fullset",
+    "merge_fullset",
+    "sync_udisk_deletions",
     "diag_vmaf_window",
     "hot_folder_worker"
 ]
