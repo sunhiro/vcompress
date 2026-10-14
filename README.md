@@ -32,6 +32,7 @@ Most batch compression scripts use a **fixed CRF value** (e.g. CRF 22 across the
 `vcompress` solves this mathematically:
 - **Binary Search Parameter Optimization**: Powered by Rust `ab-av1` lossless slice probing, it executes an automated **binary search** across the CRF/QP space to discover the exact balance point that achieves your target visual quality (**VMAF ≥ 93.0**) with maximum compression.
 - **Strict Quality Gating & Auto-Rollback**: If a video fails to meet the target VMAF or doesn't yield meaningful space reduction (e.g., `< 20%`), `vcompress` **automatically discards the attempt and leaves the original file completely untouched**.
+- **Bit-Depth Guard**: VMAF is a **luma-only** metric — it can't see 10-bit → 8-bit banding at all. Since `-e vaapi` output is 8-bit by design (the target iGPUs can't do 10-bit HEVC anyway), a 10-bit source on that path is **refused by default** rather than silently flattened (`--allow-bitdepth-downgrade` to override). Chroma (4:2:2 → 4:2:0) is allowed but always recorded in the report's pixel-format column (`--no-chroma-downgrade` to refuse it instead).
 
 ### ⚡ Key Highlights
 - **Binary Search Tuning**: No more guessing CRF. The binary search algorithm finds the sweet spot in seconds.
@@ -80,6 +81,16 @@ docker run --rm --device /dev/dri \
 pip install git+https://github.com/sunhiro/vcompress.git
 ```
 
+> ⚠ **pip only installs the Python engine.** The external binaries are *not* bundled —
+> you still need `ffmpeg` (built **with `--enable-libvmaf`**), `ab-av1` and `exiftool`
+> on `PATH`, or the VMAF quality gate cannot be computed at all:
+> ```bash
+> # macOS
+> brew install ffmpeg exiftool ab-av1
+> # Debian/Ubuntu: distro ffmpeg has NO libvmaf — use a static build
+> #   https://github.com/BtbN/FFmpeg-Builds/releases  (linux64-gpl)
+> ```
+
 #### 2. Usage Examples
 
 ```bash
@@ -120,10 +131,17 @@ You can directly instruct your AI coding assistant (Cursor / Claude / Copilot):
 `vcompress` 引入了**二分搜索算法 (Binary Search) 与 Netflix VMAF 画质门限控制**：
 1. **二分算法寻找最优解**：
    底层基于 Rust `ab-av1` 进行无损快速流切片采样，在 CRF/QP 取值区间内执行**二分搜索**，在短短数十秒内精确锁定刚好满足 `VMAF ≥ 93.0`（视觉无损基准）的最佳压缩率参数。
-2. **两道硬门槛安全拦截（失败自动撤销）**：
+2. **硬门槛安全拦截（失败自动撤销）**：
    - 画质门槛：实测 `VMAF < 93.0` 拦截；
    - 收益门槛：节省空间 `< 20%` 拦截；
-   - 触发拦截时**自动撤销转码产物并原样保留原片**，绝不劣化任何素材。
+   - 位深门槛：`-e vaapi` 路径的产物**写死 8bit**（目标核显本来也只能编 8bit HEVC），
+     所以 10bit 源在这条路上**默认拒绝**（`--allow-bitdepth-downgrade` 才放行）——
+     VMAF 只在亮度通道上算，**测不出 10bit→8bit 的色带**，而色带不可逆；
+   - 色度降级（4:2:2→4:2:0）默认放行，但一律记进报表第 8 列，让人知道发生了什么
+     （`--no-chroma-downgrade` 可改为拒绝）；
+   - 触发拦截时**自动撤销转码产物并原样保留原片**，绝不劣化任何素材；
+   - 输出路径若与源片是同一个文件（`-i x.mp4 -o x.mp4` 这种误用），**编码前直接拒绝**，
+     绝不覆写原片。
 3. **拍摄时间与 EXIF 1:1 完美保留**：
    调用 `exiftool` 无损复制 `FileCreateDate`、`CreationDate` 与相机元数据。导入 Apple Photos、群晖 Photos、Immich 等相册软件时，**时间线完全不错乱**。
 4. **AI 友好，极易通过 AI Agent 自动化下发**：
@@ -154,7 +172,7 @@ brew install sunhiro/tap/vcompress
 #### 方式二：Docker / 群晖 NAS 容器运行（零环境污染，免装依赖）
 镜像内已预装好完整版 FFmpeg、VAAPI 驱动、ExifTool 与 ab-av1：
 ```bash
-# 群晖/Linux 下利用 Intel 核显硬解硬编：
+# 群晖/Linux 下接线 Intel 核显做**硬件编码**（红线 §9：只硬编、不硬解）：
 docker run --rm --device /dev/dri \
   -v /volume1/video:/data/in \
   -v /volume1/video-compressed:/data/out \
@@ -166,6 +184,15 @@ docker run --rm --device /dev/dri \
 ```bash
 pip install git+https://github.com/sunhiro/vcompress.git
 ```
+
+> ⚠ **pip 只装 Python 引擎本体，不带外部二进制。** `ffmpeg`、`ab-av1`、`exiftool`
+> 仍需自行装好并放进 `PATH`，否则 VMAF 门限根本算不出来：
+> ```bash
+> # macOS
+> brew install ffmpeg exiftool ab-av1
+> # Debian/Ubuntu：发行版自带的 ffmpeg 没有 --enable-libvmaf，必须换静态构建
+> #   https://github.com/BtbN/FFmpeg-Builds/releases  (linux64-gpl)
+> ```
 
 ---
 
@@ -219,15 +246,18 @@ vcompress/
 ├── CLAUDE.md                  # 项目核心规范与约束 / AI Guidelines
 ├── docs/
 │   ├── ARCHITECTURE.md        # 架构设计与 VMAF 采样原理
-│   ├── RED-LINES.md           # 12 条真机踩坑红线与质量守护
+│   ├── RED-LINES.md           # 15 条真机踩坑红线与质量守护
 │   ├── PROMOTION_POSTS.md     # 社区发帖推广草稿 (V2EX / Reddit / HN)
 │   └── REGRESSION.md          # 质量回归测试说明
 ├── src/
 │   ├── vcompress_abav1.py     # 集成 Rust ab-av1 的高级二分搜寻引擎 (核心)
 │   ├── vcompress.py           # 纯 Python + FFmpeg 真机版引擎
 │   ├── export_report.py       # Excel (.xlsx) 与 Web HTML 仪表盘台账生成器
+│   ├── naming.py              # 产物命名契约 (与 vcat compress_worker.py 逐字一致, ADR-020)
+│   ├── fullset.py             # 全集清单与整树内容哈希
+│   ├── hot_folder_worker.py   # 监视目录的常驻工人
 │   └── diag_vmaf_window.py    # VMAF 窗口采样诊断工具
-├── tests/                     # 单元测试套件 (93+ 项断言锁)
+├── tests/                     # 单元测试套件 (201 项断言锁)
 └── win/                       # Windows 辅助工具与说明
 ```
 

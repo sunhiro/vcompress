@@ -1,0 +1,8 @@
+# 本仓在 Windows 上是 `core.autocrlf=true`，检出时文本文件会被写成 CRLF。
+# 对 Dockerfile 来说这是**会咬人的**：`RUN curl ... \` 这种续行后面跟一个 CR，
+# 某些构建器不认，构建会在这里莫名其妙地断掉，而文件在本机看不出任何异常。
+# Dockerfile / shell 一律锁 LF，与它在 Linux CI 和 Linux 容器里的运行环境一致。
+# （Python 源码不锁：CRLF 对解释器无影响，不为它动全仓的换行体制。）
+Dockerfile    text eol=lf
+.dockerignore text eol=lf
+*.sh          text eol=lf

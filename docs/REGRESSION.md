@@ -48,8 +48,13 @@ uv venv .venv && uv pip install --python .venv/bin/python pytest openpyxl   # �
 ### R1 · 近无损对照的标定（§3）
 
 ```
-vcompress -i <dir> -o <out> -e vaapi --file-list <只含 IMG_2150 的清单>
+python3 src/vcompress.py -i <dir> -o <out> -e vaapi --file-list <只含 IMG_2150 的清单>
 ```
+
+> ⚠ **这条必须走 `src/vcompress.py`，不是 `vcompress` 命令。** `--file-list` 只存在于
+> 真机版引擎（`vcompress.py:893`）；主引擎 `vcompress_abav1.py` 没有这个开关，
+> 照抄成本条命令会直接 `unrecognized arguments` 而**看起来像回归失败**。
+> 本节其余部分同理，R2 的命令块已经写明了入口，是一致的。
 
 | 检查点 | 期望 | 2026-08-02 实测 |
 |---|---|---|
@@ -195,6 +200,8 @@ ssh <nas-host> 'sudo -n /usr/local/bin/docker run --rm --device /dev/dri \
 |---|---|
 | 2026-08-26 | **首次在本仓执行**（此前只在 vcat 真机上跑过，见 `REVIEW_FROM_VCAT.md`）。R1·R2·R3·R4·R6·R8 ✅ / R5 ⚠ / R7 ❌ |
 | 2026-09-04 | **单元套件建立并首次跑通**：93 passed / 1 skipped（skip = 本机无 blake3，与生产一致）。真机套件 R1~R8 本次**未重跑**（无真机改动）。 |
+| 2026-10-13 | **单元套件 162 passed / 1 skipped / 3 xfailed**（新增 57 项位深·色度守卫，含跨引擎逐格式对撞；新增 14 项全量编码命令断言）。Windows 上原来的 2 条假红已消。真机套件 R1~R8 本次**未重跑**——但本轮**动了 vaapi 全量转码的命令**（ACTIVE_MEMORY §7.4-1），**R1 必须在 NAS 真机重跑一次才算数**。 |
+| 2026-10-14 | **单元套件 197 passed / 1 skipped / 3 xfailed**（+35：主引擎搜索收场的三分与红线 §1 前置守卫 `tests/test_search_outcome.py`、`_apply_replace.py` 生成模板「生成→落盘→编译→与 naming 对撞」、aac 音轨退路的接线）。真机套件 R1~R8 本次**仍未重跑**——本轮又动了搜索与全量编码两条路（RED-LINES §2/§10 补记），**R1 的欠账又厚了一层**。 |
 
 - **R1 ✅ 逐位复现 2026-08-02 的每一个数**：`IMG_2150` QP20=99.35、QP1 对照=99.99、帧数 360/360；
   `IMG_2151` QP20=49.51、QP1 对照=49.57、帧数 **359/369**。

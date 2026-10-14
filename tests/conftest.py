@@ -21,14 +21,11 @@ SRC = Path(__file__).resolve().parent.parent / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-# `vcompress_abav1` 在 **import 期**就 logging.basicConfig 一个
-# FileHandler("vcompress_abav1.log")，落点是当时的 CWD。测试模块 import 它
-# 的时机在收集阶段，CWD 还是仓库根 —— 会在仓库里拉出一个日志文件。
-# 这里先在临时目录里把它 import 掉，日志随临时目录一起消失。
+# `vcompress_abav1` 在 **import 期**就 logging.basicConfig 一个 FileHandler，
+# 落点由 `VCOMPRESS_LOG_DIR` 决定（默认 `~/.cache/vcompress/`）。这里把它指到
+# 临时目录，日志随临时目录一起消失，仓库和 CWD 都不落东西。
+# （早先靠 `os.chdir(_probe)` 再 import 的偏方已废：CWD 是全局状态，测试期间翻来
+# 翻去本身也会污染别的路径断言。）
 _probe = tempfile.mkdtemp(prefix="vcompress-tests-")
-_cwd = os.getcwd()
-try:
-    os.chdir(_probe)
-    import vcompress_abav1  # noqa: F401  仅为把 import 期副作用圈在临时目录里
-finally:
-    os.chdir(_cwd)
+os.environ["VCOMPRESS_LOG_DIR"] = _probe
+import vcompress_abav1  # noqa: E402  仅为把 import 期副作用圈在临时目录里

@@ -1,0 +1,18 @@
+# 构建上下文只需 pyproject.toml / README.md / src/，其余一律不进镜像。
+.git
+.github
+docs
+examples
+tests
+win
+memory
+*.md
+!README.md
+
+# 本地构建与运行残留：不进上下文，也别让 pip 读到过期的 egg-info
+**/__pycache__/
+**/*.py[cod]
+**/*.egg-info/
+.venv
+.pytest_cache
+*.log

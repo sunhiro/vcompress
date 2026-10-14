@@ -18,6 +18,20 @@
 原片动了，一次 bug 就是永久损失。vcat 侧为此做过**变异测试**——故意改代码让它回写原片，
 确认测试当场抓出（`state: deleted != present`）再改回来。**否则你不知道那条测试是真锁着还是恒真。**
 
+**2026-10-14 补记（唯一一条真的能摸到原片的路径：`-i x.mp4 -o x.mp4`）**：
+主引擎单文件模式下 `out_path` 就是调用方给的 `-o` **原样**。全量编码的 ffmpeg 带 `-y`，
+于是这个误用会让它**一边读一边截断同一个文件**——原片当场报废，而且不报任何错。
+
+老代码只在**失败之后**用 `samefile` 守卫（`不许删掉那个文件`），那时原片已经被覆盖过了：
+**守卫挡的是第二次伤害。** 现在把守卫提到编码之前——识别到产物路径与源片是同一个文件，
+**一次 ffmpeg 都不起**，直接记 `failed` 并写明「输出路径等于源片(拒绝覆写)」。
+
+⚠ 这条路由断点续压的「产物已存在且非空 ⇒ 跳过」**顺手**挡着——**那是巧合不是设计**
+（源片当然非空）。而且 `--preview` 恰恰**绕过**续压判据（`... and not args.preview`），
+所以判据必须是 `samefile` 而**不能是** `exists`：写成 `exists` 会让「对一棵压过的树跑预览」
+把整棵树报成 `failed`。两个方向都有测试（`tests/test_search_outcome.py`），
+且**两个方向的变异都被抓过**（拆掉守卫 / 把判据换成 `exists`）。
+
 ---
 
 ## 2. 「机器坏了」与「素材不值得压」必须分开
@@ -36,6 +50,34 @@
 **但那只覆盖了编码失败**——2026-08-02 发现**测量失败仍在伪装成质量结论**：
 19 个 `.MOV` 在**最保守的 QP20** 下拿到 VMAF 5.93~49.51，被原样写成「画质不达标」。
 QP20 近乎无损，这个分数物理上不可能是画质结论。于是补上了 `measurement_unreliable`。
+
+**2026-10-14 补记（第三处伪装：「连测都没测成」被写成素材结论）**：
+主引擎 `vcompress_abav1.py` 里 `ab-av1 crf-search` 的收场，老版只分了两类——
+找到 CRF → `dict`，**其余一律 `None` → `quality_rejected`**，detail 还写死
+「未过质量门限(VMAF<93.0)」。于是「核显没接上 / ffmpeg 少个 libvmaf 滤镜 /
+ab-av1 二进制不在」全被记成**素材压不动**，而 `quality_rejected` 是**终态**，
+下游永不重试 —— 机器故障被永久地说成素材差。
+
+现在按 ab-av1 自己给的分界线拆开（源码 `src/command/crf_search.rs`）：
+`--stdout-format json` 下**只有** `Error::NoGoodCrf` 会往 stdout 打
+`{"type":"crf-search-error","message":"Failed to find a suitable crf"}`
+（那个 `println!` 就挂在 `if let Error::NoGoodCrf { .. }` 里面），其余故障只写 stderr、stdout 是空的。
+所以：认得出那一行 → `None` → `quality_rejected`；认不出 → 抛 `AbAv1SearchError`
+→ `failed`（非终态，该重做）。
+**方向是故意的：宁可多报一次 `failed`（可重试），也不要把故障伪装成素材结论（不可逆的错账）。**
+另外 `NoGoodCrf` 同时覆盖「VMAF 不达标」和「省不够」两种，detail 里两个门都得点名——
+只写 VMAF 会在后一半上说假话。
+
+同一处还顺手堵了三个「读错也算素材结论」的口子：**读不出结果行**（退出码 0 却解析不出）
+归工具故障；`text=True` 默认的 `errors='strict'` 会让一段无关的非 UTF-8 字节
+（进度条、老素材的警告文案）把**已经成功的搜索**变成异常，改 `errors='replace'`；
+解析时**先认 `type == "crf-search-done"`** 而不是「倒着找第一个带 `crf` 的行」——
+ab-av1 中途打的 `sample-encode-done` **也带 `crf`**，认错了会把 VMAF 记成 0、节省记成 0%，
+**台账上看着只像「压得不好」**。
+
+锁在 `tests/test_search_outcome.py`，含「摘掉 `--stdout-format json`」的变异
+（摘掉之后**每一次闸门拒绝都会被读成机器故障**，终态变非终态，工人会反复重做一批
+本来就不值得压的素材）。
 
 ---
 
@@ -169,12 +211,50 @@ ffmpeg -ss X -i in -frames:v N -c:v copy -an -sn sample.mkv
 
 去掉硬件解码**零代价**：实测同一素材两种写法产物大小与 VMAF 完全一致。
 
+**2026-10-14 补记（采样段那条硬解是 ab-av1 的，不是我们的）**：
+我们对 `ab-av1 crf-search` **不传** `--enc-input`，而 ab-av1 对 `*_vaapi` 有内置输入默认值。
+源码 `src/command/args/encode.rs`：
+
+```rust
+fn default_ffmpeg_input_args(&self) -> &[(&'static str, &'static str)] {
+    match self.as_str() {
+        e if e.ends_with("_vaapi") => &[("-hwaccel", "vaapi"), ("-hwaccel_output_format", "vaapi")],
+```
+
+也就是说**它自己的 15 秒采样默认就是硬解**。这与 §9 不矛盾：§9 记的正是
+「硬解只在全片长跑时才暴露坏点，采样窗口碰不上坏点」，所以采样留着硬解可以接受；
+**我们自己拼的那条全量命令**（`run_ab_av1_encode`）依然只有 `-vaapi_device`、
+绝不出现 `-hwaccel` —— 这一半不可让，`tests/test_encode_cmd.py` 直接对着拼出来的
+argv 断言 `"-hwaccel" not in cmd`。
+
+⚠ ab-av1 没把这条路焊死（`--enc-input hwaccel=none --enc-input hwaccel_output_format=none`
+可以摘掉默认值），**但摘之前要先想清楚**：ab-av1 全篇没有 `hwupload`，摘掉硬解就得
+自己用 `--vfilter format=nv12,hwupload` 把帧送上显存（`-vf` / `-filter:v` 在它那儿是
+保留字，会报错要求改用 `--vfilter`），否则 `hevc_vaapi` 拿到的还是系统内存里的软帧，
+照样 `Impossible to convert`。**这条路没验过**，别顺手去「统一」它。
+
+⚠ 状态：以上全部是**读源码**的结论。`-e vaapi` 这条臂**至今没在真机跑过一次**
+（本机无核显）。核显接线到底通不通，只有 NAS 上跑一次 R1 才算数 —— 见 TODO。
+
 ---
 
 ## 10. 绝不静默丢音轨
 
 MP4 装不下 MP2/PCM 这类老音轨（DVD 抓轨、老相机 AVI 全是），`-c:a copy` 会被 muxer 拒。
 此时**退成 aac 重来一次**，而不是丢掉音轨。家庭影像没声音等于废了。
+
+**2026-10-14 补记**：这条退路此前**只有备份引擎 `vcompress.py` 有**
+（`vcompress.py:861-871`），主引擎 `vcompress_abav1.py` 的全量编码一直只有
+`-c:a copy` —— 撞上老音轨就是**闸门已经过了、整片白跑一场**。
+现按同一口径补齐：copy 失败 → 打日志、退成 aac 重来**一次**；再失败就收手、
+清残片、记 `failed`（不无限重试）。**退成 aac 不是「丢音轨」**：换一种容器认的编码，
+§10 禁的是静默丢，不是不许转码；而且这里全程留痕、不会静默。
+
+刻意**没有**开成 CLI 参数（备份引擎那个 `--audio copy|aac` 是给用户手选的）。
+自动退路够用，多一个开关就多一行要维护的文档。
+
+锁在 `tests/test_encode_cmd.py`：真走一遍 `process_file_abav1`，验 audio 调用序列是
+`["copy", "aac"]`、成功时不空转、两条都失败时残片被清掉。
 
 ---
 
@@ -195,6 +275,23 @@ MP4 装不下 MP2/PCM 这类老音轨（DVD 抓轨、老相机 AVI 全是），`
 
 10bit 现在撞不上，只因为 **HEVC 默认跳过**、而消费级 10bit 几乎都是 HEVC。
 **这是巧合的安全，不是设计的安全**——谁加一次 `--recompress-hevc`，洞就开了。
+
+**2026-10-13 补记（两条引擎的守卫实现状态）**：
+
+- `vcompress.py`：`FORCED_OUTPUT_PIX`（`:234`）/ `pix_bit_depth`（`:202`）/ `pix_chroma`（`:216`）
+  一直是齐的，守卫内联在 `:701-720`，状态 `skipped_bitdepth_guard` / `skipped_chroma_guard`。
+- `vcompress_abav1.py`：**此前根本没有这道守卫**（只有 `--skip-hdr` 那条默认关的规则）。
+  已按 `vcompress.py` 逐字同源补齐：同一张表、同一组判定、同两个开关名
+  （`--allow-bitdepth-downgrade` / `--no-chroma-downgrade`）、同一组状态串。两份实现由
+  `tests/test_bitdepth_guard.py` **逐格式对撞**锁着（与 `test_naming.py` 锁跨仓命名同理）。
+- 🔴 **那次补漏之前，abav1 这条洞是真的通的，不是「巧合安全」**：
+  它的 HEVC 跳过判据是**码率**（`--max-hevc-bitrate`，默认 30Mbps），不是「是 HEVC 就跳」。
+  一个 40Mbps 的 10bit HEVC 原片不满足跳过条件，会一路走到 vaapi 全量转码 ——
+  而 vaapi 支路写死 `format=nv12`，产物静默变 8bit。
+- 同一轮还修掉一个**假跳过**：`--skip-hdr` 原来用子串判位深
+  （`'10' in pix_fmt or '12' in pix_fmt`），而 `'12' in 'nv12'`、`'10' in 'yuv410p'`
+  都成立 —— **普通 8bit 源被当成 10bit HDR 跳过，理由还是假的**。现改用
+  `pix_bit_depth()` 真解析。
 
 **⚠ `format=yuv420p` 这类「测量前统一像素格式」的做法未经验证，暂不采用**：
 `yuvj -> yuv` 是全范围到有限范围的转换，**直接改动亮度**，而 VMAF 恰恰只看亮度。

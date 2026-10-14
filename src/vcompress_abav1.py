@@ -6,6 +6,7 @@ vcompress_abav1.py - 基于 Rust 后端 ab-av1 的高级择优视频压缩与 VM
 """
 
 import os
+import re
 import sys
 import subprocess
 import shutil
@@ -20,14 +21,63 @@ from naming import marked_name
 from fullset import (read_manifest, write_manifest, manifest_row, full_hash,
                      plan_move_untouched, apply_moves, HASHING_AVAILABLE)
 
+#: VAAPI 设备节点。与 `vcompress.py` 同一个环境变量、同一个默认值，
+#: 保证两条引擎在同一台机器上接到同一块核显。
+VAAPI_DEVICE = os.environ.get('VCAT_VAAPI_DEVICE', '/dev/dri/renderD128')
+
+#: 认 `-preset` 的编码器（都是软编）。硬件编码器没有这个 AVOption，
+#: 硬塞进去 ffmpeg 会直接报错退出，见 `run_ab_av1_encode` 里的说明。
+_PRESET_ENCODERS = {'libx264', 'libx265', 'libsvtav1'}
+
+#: ab-av1 用 `--stdout-format json` 时，**只有**「闸门拒了」会往 stdout 打这一行
+#: （源码 `src/command/crf_search.rs`：那个 `println!` 挂在
+#: `if let Error::NoGoodCrf { .. }` 里面），其余故障一律只走 stderr。
+#: 见 `run_ab_av1_search` 的 docstring —— 这一行是「素材结论」与「机器故障」的
+#: 唯一分界线，字符串本身是被当成契约用的，别随手改。
+_ABAV1_NO_GOOD_CRF_MSG = "Failed to find a suitable crf"
+
+
+class AbAv1SearchError(RuntimeError):
+    """`ab-av1 crf-search` **自己跑挂了**（机器故障），不是闸门拒了。
+
+    为什么要单独一个类型：这两件事在结果上都是「没拿到 CRF」，但一个该记成
+    `quality_rejected`（素材结论，重跑还是这个结果），一个该记成 `failed`
+    （机器故障，值得重试）。混成一个会让下游把「核显没接上」读成「这素材画质不行」——
+    红线 §2 那一类假结论。见 `process_file_abav1` 第 7 步。
+    """
+
+
+def _log_file_handler():
+    """日志文件的落点。
+
+    🔴 **绝不落在当前工作目录。** 老版写死 `FileHandler("vcompress_abav1.log")`，
+    落点是当时的 CWD：容器里的 WORKDIR 是 `/data`（用户挂载进来的素材目录），
+    跑一次批就在人家的素材树下留一个日志文件；Mac 上也会写进随便 cd 到的目录。
+    改为用户级状态目录，`VCOMPRESS_LOG_DIR` 可覆盖（`tests/conftest.py` 靠它
+    把 import 期副作用圈进临时目录）。
+
+    目录建不出来就退回只打 stdout —— 日志问题不许把跑批带崩。
+    """
+    base = os.environ.get('VCOMPRESS_LOG_DIR')
+    try:
+        log_dir = Path(base) if base else Path.home() / '.cache' / 'vcompress'
+        log_dir.mkdir(parents=True, exist_ok=True)
+        return logging.FileHandler(log_dir / 'vcompress_abav1.log', mode='a', encoding='utf-8')
+    except (OSError, RuntimeError) as exc:
+        print(f"[WARN] 日志文件不可写（{exc}），本次仅输出到 stdout", file=sys.stderr)
+        return None
+
+
 # 日志配置
+_log_handlers = [logging.StreamHandler(sys.stdout)]
+_file_handler = _log_file_handler()
+if _file_handler is not None:
+    _log_handlers.append(_file_handler)
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler("vcompress_abav1.log", mode='a', encoding='utf-8')
-    ]
+    handlers=_log_handlers
 )
 logger = logging.getLogger("vcompress_abav1")
 
@@ -137,7 +187,25 @@ def map_encoder_flag(encoder):
     return encoder
 
 def run_ab_av1_search(input_path, encoder_name, min_vmaf, max_percent, sample_sec=10, samples_cnt=3, vmaf_threads=6, scale_1080p=True):
-    """使用 ab-av1 crf-search 二分搜寻最佳 CRF/QP"""
+    """使用 ab-av1 crf-search 二分搜寻最佳 CRF/QP。
+
+    返回值踩在两种「没拿到 CRF」上，**必须分开**：
+
+    - ``dict``  —— 找到了达标的 CRF。
+    - ``None``  —— **闸门拒了**：ab-av1 正常跑完，但这个素材既压不到
+      ``min_vmaf`` 也省不下 ``max_encoded_percent``。这是**素材结论**，
+      重跑一万次还是这个结果，记 ``quality_rejected``。
+
+    机器故障则**抛 `AbAv1SearchError`**：ffmpeg 崩了、采样没有输出、
+    JSON 解析不出来……这些是**机器故障**，重跑可能就好了，必须记 ``failed``。
+    老版把这两种都 return None，于是「NAS 上核显没接上 / ffmpeg 少个滤镜」
+    会被写成 `quality_rejected`，detail 还写着「未过质量门限(VMAF<93.0)」——
+    **一条把机器故障说成素材差的假结论**，正是红线 §2 点名的东西。
+
+    分界线是 ab-av1 自己给的：`--stdout-format json` 下，只有闸门拒了
+    （源码里的 `Error::NoGoodCrf`）才会往 stdout 打一行带
+    ``"type":"crf-search-error"`` 的 JSON，其余故障只写 stderr、stdout 是空的。
+    """
     enc_flag = map_encoder_flag(encoder_name)
     cmd = [
         'ab-av1', 'crf-search',
@@ -159,36 +227,124 @@ def run_ab_av1_search(input_path, encoder_name, min_vmaf, max_percent, sample_se
         cmd.extend(['--high-crf-means-hq', 'true'])
 
     try:
-        res = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        lines = [line.strip() for line in res.stdout.strip().splitlines() if line.strip()]
-        for line in reversed(lines):
-            try:
-                data = json.loads(line)
-                if "crf" in data:
-                    return data
-            except Exception:
-                continue
-        logger.error(f"无法找到有效的 ab-av1 JSON 结果行，输出为:\n{res.stdout}")
-        return None
+        # errors='replace'：stderr 里混进非本编码的字节时（indicatif 的进度条、
+        # 老编码素材的警告文案）不许把**已经成功的这次搜索**变成解码异常。
+        res = subprocess.run(cmd, capture_output=True, text=True, check=True, errors='replace')
     except subprocess.CalledProcessError as e:
-        logger.error(f"ab-av1 crf-search 失败: {e.stderr}")
-        return None
+        stdout = e.stdout or ""
+        if _is_gate_rejection(stdout):
+            logger.info("   [闸门] ab-av1 判定该素材压不到目标门限，正常结论（不是机器故障）。")
+            return None
+        raise AbAv1SearchError(
+            f"ab-av1 退出码 {e.returncode}，且 stdout 没有闸门拒斥标记："
+            f"{(e.stderr or '').strip()[-400:]}"
+        ) from e
     except Exception as e:
-        logger.error(f"解析 ab-av1 JSON 失败: {e}")
-        return None
+        raise AbAv1SearchError(f"ab-av1 无法执行（{type(e).__name__}: {e}）") from e
 
-def run_ab_av1_encode(input_path, output_path, encoder_name, crf_val, preset=None):
-    """使用原生 FFmpeg 进行全量转码，隔离 Apple mebx 沉浸数据轨"""
+    parsed = []
+    for line in (res.stdout or "").strip().splitlines():
+        try:
+            data = json.loads(line.strip())
+        except Exception:
+            continue
+        if isinstance(data, dict):
+            parsed.append(data)
+
+    # 🔴 **先认 type**，再退回老口径「任一带 crf 的行」。ab-av1 中途还会往
+    # stdout 打 `sample-encode-done`（它的 `Update::SampleEncodeDone`），那种行
+    # **也带 `crf`**，却没有 `vmaf` / `predicted_encode_*` —— 拿错了就会把
+    # VMAF 记成 0、节省记成 0%，而台账上看起来只是「压得不好」。
+    # 正常情况最后一行就是 `crf-search-done`，倒着找本来就先撞到它；
+    # 留着兜底是**不拿 ab-av1 改个 type 名去赌整条路**。
+    for data in reversed(parsed):
+        if data.get("type") == "crf-search-done" and "crf" in data:
+            return data
+    for data in reversed(parsed):
+        if "crf" in data:
+            logger.warning("   [注意] ab-av1 没给 `crf-search-done` 行，"
+                           "退用第一条带 crf 的记录（vmaf / 预估节省可能缺失）。")
+            return data
+
+    # 退出码 0 却读不出结果行：这不是「素材不行」，是工具或解析出了问题。
+    raise AbAv1SearchError(
+        f"ab-av1 退出码 0 但 stdout 里没有可解析的 crf 结果行：{(res.stdout or '').strip()[-400:]!r}"
+    )
+
+
+def _is_gate_rejection(stdout):
+    """stdout 里有没有 ab-av1 那条「闸门拒了」的标记行。
+
+    只认 `Error::NoGoodCrf` 打出来的那一种（`message` 是定值，见模块顶部
+    `_ABAV1_NO_GOOD_CRF_MSG`）。认不出来就一律当机器故障 —— 方向是故意的：
+    **宁可多报一次 failed（可重试），也不要把故障伪装成素材结论（不可逆的错误账）。**
+    """
+    for line in (stdout or "").strip().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            data = json.loads(line)
+        except Exception:
+            continue
+        if (isinstance(data, dict)
+                and data.get("type") == "crf-search-error"
+                and _ABAV1_NO_GOOD_CRF_MSG in str(data.get("message", ""))):
+            return True
+    return False
+
+
+def run_ab_av1_encode(input_path, output_path, encoder_name, crf_val, preset=None, audio='copy'):
+    """使用原生 FFmpeg 进行全量转码，隔离 Apple mebx 沉浸数据轨
+
+    🔴 VAAPI 这条支路必须手工接硬件：**全量转码这一段是我们自己拼的 ffmpeg 命令**，
+    ab-av1 的任何默认值在这里都不生效。老代码只把编码器名换成 `hevc_vaapi` 就发车，
+    缺 `-vaapi_device` / `hwupload` —— 裸跑必然 `Impossible to convert between the
+    formats`，等于 README 里 NAS 那一条路根本走不通。
+
+    ⚠ **采样段和全量段不是同一套解码**，这个分裂要写下来（2026-10-14 核对 ab-av1
+    源码 `src/command/args/encode.rs`）：我们对 `crf-search` **不传** `--enc-input`，
+    而 ab-av1 对 `*_vaapi` 有内置输入默认值 —— `default_ffmpeg_input_args()` 里
+    `e if e.ends_with("_vaapi") => &[("-hwaccel","vaapi"), ("-hwaccel_output_format","vaapi")]`，
+    也就是说**它自己的 15 秒采样默认就是硬解**；我们这边只做硬编、绝不硬解。
+    这不是疏忽而是红线 §9 的边界：§9 记录的是「硬解只在全片长跑时才暴露坏点，
+    采样窗口碰不上」，所以采样的硬解可以留着。
+
+    好在 ab-av1 没把这条路焊死（同一份源码：`--enc-input hwaccel=none
+    --enc-input hwaccel_output_format=none` 可以摘掉默认值），**但摘掉之前先想清楚**：
+    ab-av1 全篇没有 `hwupload`，摘掉硬解就得自己用 `--vfilter format=nv12,hwupload`
+    把帧送上显存（`-vf` / `-filter:v` 在它那儿是保留字、会报错要求改用 `--vfilter`），
+    否则 `hevc_vaapi` 拿到的还是系统内存里的软帧，照样 `Impossible to convert`。
+    **这条路没验过**，别想当然，也别顺手去"统一"它。
+
+    ⚠ 只做硬件**编码**，绝不加 `-hwaccel vaapi` 硬解：红线 §9，全长编码会在
+    `Failed to sync surface` 上崩。采样段那个硬解是 ab-av1 自己的事，与这条命令无关。
+
+    ⚠ 与 `vcompress.py:247-269` 那条**过了回归的**写法是**同一组参数、不是逐字相同**：
+    那边把 `-vf` 放在 `-map` 之前、另加了 `-hide_banner -loglevel error` 与
+    `-map_metadata 0`。`-vf` 是输出选项，位置不影响语义；元数据这边走的是
+    exiftool 那一步。**别把「同源」当口号**——两条引擎的 ffmpeg 命令是各写各的，
+    改这条时唯一可信的参照是真机跑一遍（R1）。
+
+    `audio` 只由调用方在**重试**时传 `'aac'`（默认 `'copy'`，见 `process_file_abav1`
+    第 8 步）：MP4/MOV 装不下 MP2/PCM 这类老音轨时 `-c:a copy` 会被 muxer 拒，
+    整片编码因此白跑。**这不是「丢音轨」**——是换一种容器认的编码，红线 §10 禁的是
+    静默丢，不是不许转码。刻意**不**开成 CLI 参数：备份引擎那个 `--audio copy|aac`
+    是给用户手选的，这边自动退路够用，多一个开关就多一行要维护的文档。
+    """
     enc_flag = map_encoder_flag(encoder_name)
-    cmd = [
-        'ffmpeg', '-y',
+    cmd = ['ffmpeg', '-y']
+    if enc_flag == 'hevc_vaapi':
+        # 输入侧：显式指定渲染节点（软编路径不需要）
+        cmd.extend(['-vaapi_device', VAAPI_DEVICE])
+    cmd.extend([
         '-i', str(input_path),
         '-map', '0:v:0',
         '-map', '0:a?',
         '-c:v', enc_flag,
-        '-c:a', 'copy',
+        '-c:a', str(audio),
         '-movflags', '+faststart'
-    ]
+    ])
     if enc_flag == 'hevc_videotoolbox':
         cmd.extend(['-q:v', str(int(crf_val)), '-tag:v', 'hvc1'])
     elif enc_flag == 'libx265':
@@ -197,23 +353,45 @@ def run_ab_av1_encode(input_path, output_path, encoder_name, crf_val, preset=Non
         cmd.extend(['-crf', str(crf_val)])
     elif enc_flag == 'libx264':
         cmd.extend(['-crf', str(crf_val)])
+    elif enc_flag == 'hevc_vaapi':
+        # 输出侧：帧要从系统内存上传到显存，且 VAAPI 用 -qp，没有 -crf/-q:v
+        cmd.extend(['-vf', 'format=nv12,hwupload', '-qp', str(int(crf_val)), '-tag:v', 'hvc1'])
     else:
         cmd.extend(['-q:v', str(crf_val)])
 
     if preset:
-        cmd.extend(['-preset', str(preset)])
+        # 🔴 只有这几个编码器有 `-preset` 这个 AVOption。hevc_vaapi / hevc_videotoolbox
+        # 都没有——塞进去 ffmpeg 会 `Option preset not found` 直接报错退出。
+        # 旧代码无条件追加，只是以前 vaapi 那条臂根本跑不起来，所以没人撞上；
+        # **硬件接线修好之后 `-e vaapi --preset X` 就够得着了**（同一批修复开出的新口子）。
+        # 丢掉用户的显式参数必须说出来，不能静默忽略。
+        if enc_flag in _PRESET_ENCODERS:
+            cmd.extend(['-preset', str(preset)])
+        else:
+            logger.warning(f"   [注意] {enc_flag} 无 -preset 选项，已忽略 --preset {preset}"
+                           f"（硬塞会让 ffmpeg 报 'Option preset not found' 并失败）。")
 
     cmd.append(str(output_path))
 
     try:
         process = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         if process.returncode != 0:
-            logger.error(f"FFmpeg 编码失败: {process.stderr.decode('utf-8', errors='ignore')}")
-            return False
-        return True
+            err = process.stderr.decode('utf-8', errors='ignore')
+            logger.error(f"FFmpeg 编码失败: {err}")
+            return False, err
+        return True, ""
     except Exception as e:
         logger.error(f"执行 FFmpeg 转码异常: {e}")
-        return False
+        return False, str(e)
+
+
+# muxer 拒收音轨编解码的报错特征（`-c:a copy` 装不下 MP2/PCM 时 ffmpeg 的原文）。
+# 🔴 退路**只**对着这类失败走：盘满 / SMB 断连 / VAAPI 故障重试也照样失败，
+# 白跑一遍整片编码不说，日志还把原因硬说成「音轨装不下」——那是说假话。
+_AUDIO_MUX_ERROR = re.compile(
+    r'Could not find tag for codec|codec not currently supported in container',
+    re.IGNORECASE,
+)
 
 def pix_column(src_pix, out_pix):
     """台账第 8 列「像素格式」：`源->产物`（ADR-019 决策 2/3、ADR-027）。
@@ -227,9 +405,128 @@ def pix_column(src_pix, out_pix):
     return out_pix or ""
 
 
+# semi-planar 那一族的名字里**不带**色度数字，也不带位深后缀，只能查表。
+# 🔴 别想用正则糊过去：`nv12` 的 12 不是位深也不是色度，`p010le` 的 010 才是位深。
+#    VAAPI 用的正是这族名字（nv12 / p010），漏了它就会把 10bit 产物读成 8bit。
+_SEMI_PLANAR = {
+    'nv12': (8, '420'), 'nv21': (8, '420'), 'nv16': (8, '422'), 'nv24': (8, '444'),
+    'p010': (10, '420'), 'p012': (12, '420'), 'p016': (16, '420'),
+    'p210': (10, '422'), 'p216': (16, '422'),
+    'p410': (10, '444'), 'p416': (16, '444'),
+}
+
+# 这些编码路径的产物位深/色度是**写死**的，不看源片。
+# vaapi 支路写死 `-vf format=nv12,hwupload`，nv12 就是 8bit 4:2:0 —— 10bit 源进去
+# 会被静默降位深；而目标硬件（J3455 / Apollo Lake Gen9 及以下）的核显本来也只能编
+# 8bit HEVC，改 p010 也救不回来。所以正确做法是**拒绝**（红线 §11），不是偷偷降。
+#
+# 🔴 这份表与这几个函数跟 `vcompress.py:186-234` **逐字同源**（那边是单一出处），改一边就得改另一边。
+FORCED_OUTPUT_PIX = {'vaapi': ('nv12', 8, '420')}
+
+
+def _strip_endian(pix_fmt):
+    return re.sub(r'(le|be)$', '', (pix_fmt or '').strip())
+
+
+def pix_bit_depth(pix_fmt):
+    """读位深：yuv420p10le -> 10、p010le -> 10、yuv420p -> 8。
+
+    ⚠ 「认不出按 8 算」只对**探不出来的元数据**（`?` / `""`）成立——不据此拦人。
+    对**认得出的格式名**，位深必须真解析：gray10le 曾一路漏到这里被按 8 放行，
+    10-bit 灰度源绕过 bitdepth_guard 静默降成 8bit（2026-10-14 复检发现的真缺陷）。
+    """
+    base = _strip_endian(pix_fmt)
+    if base in _SEMI_PLANAR:
+        return _SEMI_PLANAR[base][0]
+    m = re.search(r'p(\d+)$', base)          # 平面格式：位深跟在结尾的 p 后面
+    if m:
+        try:
+            return int(m.group(1))
+        except ValueError:
+            pass
+    g = re.search(r'gray(\d+)$', base)       # gray 族：gray10le / gray12be …（裸 gray 是 8bit）
+    if g:
+        return int(g.group(1))
+    return 8
+
+
+def pix_chroma(pix_fmt):
+    """读色度采样：444 / 422 / 420 / gray 等。认不出返回 '?'。"""
+    base = _strip_endian(pix_fmt)
+    if base in _SEMI_PLANAR:
+        return _SEMI_PLANAR[base][1]
+    if 'gray' in base:
+        return 'gray'
+    # 平面格式形如 yuv/yuvj/yuva + 三位色度数字，只在**开头那段**里找，
+    # 避免把 yuv420p10 里的位深数字误读成色度。
+    m = re.match(r'yuv[ja]?(\d{3})', base)
+    if m and m.group(1) in ('444', '440', '422', '420', '411', '410'):
+        return m.group(1)
+    return '?'
+
+
+def bitdepth_guard(src_pix, encoder, allow_downgrade=False):
+    """🔴 位深守卫（红线 §11）：源片位深 > 该编码器写死的产物位深 → 拒绝。
+
+    为什么不能交给闸门：VMAF **只在亮度通道上算**，对 10bit→8bit 的渐变色带
+    (banding) 不敏感。「VMAF 94」只说明亮度没问题，对位深降级一个字都没说 ——
+    而 banding 不可逆。闸门测不出来的损失，就不该由闸门顺手放行。
+
+    放行返回 `None`；拒绝返回写进台账 decision 列的人话。
+    抽成纯函数是为了能被 `tests/` 锁住（与 `pix_column` / `json_status_for` 同样处理）。
+    """
+    forced = FORCED_OUTPUT_PIX.get(encoder)
+    if not forced:
+        return None
+    _fname, f_depth, _f_chroma = forced
+    s_depth = pix_bit_depth(src_pix)
+    if s_depth > f_depth and not allow_downgrade:
+        return f"位深守卫(拒绝 {s_depth}bit→{f_depth}bit)"
+    return None
+
+
+def chroma_downgrade_note(src_pix, encoder):
+    """色度降级：**默认放行，但必须留下痕迹**（红线 §11）。
+
+    与位深不同：4:2:2→4:2:0 是 H.265 交付常规，真机上那 50 个 `yuvj422p` 全是老
+    MJPEG SD 素材，影响极小；**且原片始终不动，事后可重压**。所以这里不拦，
+    只是让日志说一句，真正的落点在台账第 8 列（实测的 `源->产物`）。
+    """
+    forced = FORCED_OUTPUT_PIX.get(encoder)
+    if not forced:
+        return None
+    _fname, _f_depth, f_chroma = forced
+    s_chroma = pix_chroma(src_pix)
+    if s_chroma in ('?', 'gray') or s_chroma == f_chroma:
+        return None
+    return f"色度将由 {s_chroma} 降到 {f_chroma}（{src_pix or '?'} -> {_fname}）"
+
+
+def chroma_guard(src_pix, encoder, refuse_downgrade=False):
+    """色度守卫（红线 §11）：**只有显式要求时才拦**，默认放行。
+
+    默认放行的理由是色度降级可逆地没那么严重：4:2:2→4:2:0 是 H.265 交付常规，
+    原片始终不动、事后可重压。但「默认放行」不等于「不许有人不接受」——
+    `--no-chroma-downgrade` 就是给那种场合的。
+
+    🔴 与 `vcompress.py:712-716` 同一语义、同一开关名、同一状态串
+    （`skipped_chroma_guard`）。跨引擎只对**默认行为**做逐格式对撞，因为备份引擎
+    那段是内联在流程里的，没有可比的纯函数；这条只锁自己的行为。
+    """
+    if not refuse_downgrade:
+        return None
+    forced = FORCED_OUTPUT_PIX.get(encoder)
+    if not forced:
+        return None
+    _fname, _f_depth, f_chroma = forced
+    s_chroma = pix_chroma(src_pix)
+    if s_chroma in ('?', 'gray') or s_chroma == f_chroma:
+        return None
+    return f"色度守卫(拒绝 {s_chroma}→{f_chroma})"
+
+
 def json_status_for(status):
     """内部 status → `--json-out` 对外 status（供 vcat 的工人按状态显式分派）。
-
     🔴 四类**必须各走各的**，合并任意两类都会在下游变成记账错误：
       - `success`          压成功
       - `quality_rejected` 闸门拒了 —— **素材结论**，终态，重跑还是这个结果
@@ -324,6 +621,27 @@ def process_file_abav1(src_path, out_path, args):
     orig_bytes = src_path.stat().st_size
     orig_mb = orig_bytes / (1024 * 1024)
 
+    # 0. 🔴 红线 §1：产物路径与源片是同一个文件时，**在动手之前**就拒绝。
+    #
+    #    单文件模式下 `out_path` 就是调用方给的 `-o`。`-i x.mp4 -o x.mp4` 这种误用
+    #    会让全量编码的 ffmpeg `-y` **一边读一边截断同一个文件**——原片当场报废，
+    #    而且不报任何错（红线 §1「绝不损坏或静默覆写原始文件」）。
+    #
+    #    老代码只在**失败之后**用 `samefile` 守卫，那时原片已经被覆盖过了，
+    #    守卫挡的其实是第二次伤害（删掉那个文件）。这里把它提到编码之前。
+    #
+    #    ⚠ 今天这条路由断点续压的「产物已存在且非空 ⇒ 跳过」顺手挡住了——
+    #    **那是巧合不是设计**：源片当然非空。换个布局或改掉续压判据它就漏了。
+    #    「当前走不到」不是不设防的理由。
+    try:
+        if out_path.exists() and out_path.samefile(src_path):
+            logger.error(f"   [拒绝] 输出路径与源片是同一个文件，绝不覆写原片: {out_path}")
+            return "failed", orig_mb, 0.0, 0.0, "NA", "NA", "输出路径等于源片(拒绝覆写)", ""
+    except OSError:
+        # 探不到（权限/竞态）时不在这里拦——真到写那一步 ffmpeg 会自己失败，
+        # 不会静默覆写一个我们连 stat 都做不到的文件。
+        pass
+
     # 1. 跳过小文件
     if orig_mb < args.min_file_mb:
         logger.info(f"   [跳过: 低性价比] 文件大小 {orig_mb:.1f}MB < 门限 {args.min_file_mb:.1f}MB。")
@@ -343,35 +661,69 @@ def process_file_abav1(src_path, out_path, args):
         return "skipped_low_hevc", orig_mb, 0.0, 0.0, "NA", "NA", "已是高效HEVC(跳过)", pix_fmt
 
     # 3. 择优规则过滤 2：跳过 10-bit HDR / 高色彩深度视频 (耗时长、性价比低)
-    if args.skip_hdr and ('10' in pix_fmt or 'p10' in pix_fmt or '12' in pix_fmt):
-        logger.info(f"   [跳过: 10-bit HDR] 像素格式 {pix_fmt} 为 10-bit/12-bit，转码耗时长性价比低，跳过。")
-        return "skipped_hdr", orig_mb, 0.0, 0.0, "NA", "NA", "10-bit HDR(跳过)", pix_fmt
+    #    🔴 判据必须用 pix_bit_depth() 真解析，不能拿 `'12' in pix_fmt` 这种子串去糊：
+    #    老写法里 `'12' in 'nv12'` 成立、`'10' in 'yuv410p'` 也成立，于是
+    #    **普通 8bit 源被当成 10bit HDR 跳过**，而且报出来的理由是假的。
+    src_depth = pix_bit_depth(pix_fmt)
+    if args.skip_hdr and src_depth > 8:
+        logger.info(f"   [跳过: {src_depth}-bit HDR] 像素格式 {pix_fmt} 位深 {src_depth}bit > 8bit，转码耗时长性价比低，跳过。")
+        return "skipped_hdr", orig_mb, 0.0, 0.0, "NA", "NA", f"{src_depth}-bit HDR(跳过)", pix_fmt
 
-    # 4. 择优规则过滤 3：跳过本身码率极低的视频
+    # 4. 位深守卫（红线 §11）—— 放在搜索**之前**：拦下来就不必白跑一次二分。
+    verdict = bitdepth_guard(pix_fmt, args.encoder, args.allow_bitdepth_downgrade)
+    if verdict:
+        logger.warning(
+            f"   [跳过: 位深守卫] 源片 {pix_fmt} 是 {src_depth}bit，而 {args.encoder} 路径固定输出 "
+            f"8bit —— 会静默降位深，且 VMAF 只测亮度、测不出 banding。"
+            f"确需如此用 --allow-bitdepth-downgrade。")
+        return "skipped_bitdepth_guard", orig_mb, 0.0, 0.0, "NA", "NA", verdict, pix_fmt
+
+    # 5. 色度守卫 / 留痕（红线 §11）—— 默认放行，只有 --no-chroma-downgrade 才拦。
+    verdict = chroma_guard(pix_fmt, args.encoder, args.no_chroma_downgrade)
+    if verdict:
+        logger.warning(f"   [跳过: 色度守卫] 源片 {pix_fmt} 的色度会被降到 4:2:0，"
+                       f"而 --no-chroma-downgrade 生效。")
+        return "skipped_chroma_guard", orig_mb, 0.0, 0.0, "NA", "NA", verdict, pix_fmt
+
+    note = chroma_downgrade_note(pix_fmt, args.encoder)
+    if note:
+        logger.info(f"   [注意] {note} —— VMAF 不评估色度，已记入台账第 8 列。")
+
+    # 6. 择优规则过滤 3：跳过本身码率极低的视频
     if bitrate_mbps < args.min_bitrate:
         logger.info(f"   [跳过: 极低码率] 视频码率 {bitrate_mbps:.2f}Mbps < 最低限制 {args.min_bitrate:.2f}Mbps，原样保留。")
         return "skipped_low_bitrate", orig_mb, 0.0, 0.0, "NA", "NA", "极低码率(跳过)", pix_fmt
 
-    # 5. 运行 ab-av1 二分查找测算最佳 CRF/QP
+    # 7. 运行 ab-av1 二分查找测算最佳 CRF/QP
     logger.info(f"   [ab-av1 二分寻找] 目标 VMAF >= {args.vmaf_min}, 最低空间节省率 >= {args.min_saving_pct}%, VMAF线程={args.vmaf_threads}...")
     max_percent = 100.0 - args.min_saving_pct
 
-    search_res = run_ab_av1_search(
-        src_path, args.encoder,
-        min_vmaf=args.vmaf_min,
-        max_percent=max_percent,
-        sample_sec=args.sample_sec,
-        samples_cnt=args.samples,
-        vmaf_threads=args.vmaf_threads,
-        scale_1080p=args.vmaf_scale_1080p
-    )
+    search_res = None
+    try:
+        search_res = run_ab_av1_search(
+            src_path, args.encoder,
+            min_vmaf=args.vmaf_min,
+            max_percent=max_percent,
+            sample_sec=args.sample_sec,
+            samples_cnt=args.samples,
+            vmaf_threads=args.vmaf_threads,
+            scale_1080p=args.vmaf_scale_1080p
+        )
+    except AbAv1SearchError as e:
+        # 🔴 机器故障，**不是**素材结论：ab-av1 崩了 / 没输出 / 跑不起来。
+        # 老版这里 return None 一路落到下面那句「未过质量门限」，把「核显没接上」
+        # 记成了「这素材画质不行」——一条不可逆的假账（红线 §2）。
+        logger.error(f"   [失败: 工具故障] ab-av1 质量搜索没有跑完: {e}")
+        return "failed", orig_mb, 0.0, 0.0, "NA", "NA", f"ab-av1 工具故障: {e}", pix_fmt
 
-    if not search_res:
-        logger.warning("   [拦截/跳过] ab-av1 质量搜索未找到达标 CRF (无法兼顾 VMAF 93 分与 20% 空间节省)。")
-        # 🔴 「闸门拒了」是**素材结论**（终态，重跑还是这个结果），
-        # 「编码失败」是**机器故障**（值得重试）。两者都叫 failed，下游就只能
-        # 靠字符串匹配 detail 去猜，而 vcat 服务端 P2-44 刚花力气把这两件事分开。
-        return "quality_rejected", orig_mb, 0.0, 0.0, "NA", "NA", f"未过质量门限(VMAF<{args.vmaf_min})", pix_fmt
+    if search_res is None:
+        # 闸门拒了 = 素材结论（终态，重跑还是这个结果）。两个门都要点名：
+        # ab-av1 的 NoGoodCrf 同时覆盖「VMAF 不达标」和「省不够」两种，
+        # 只写 VMAF 会在「省不够」那一半上说假话。
+        logger.warning(f"   [拦截/跳过] ab-av1 质量搜索未找到达标 CRF "
+                       f"(无法兼顾 VMAF {args.vmaf_min} 分与 {args.min_saving_pct}% 空间节省)。")
+        return ("quality_rejected", orig_mb, 0.0, 0.0, "NA", "NA",
+                f"未过质量门限(VMAF<{args.vmaf_min} 或 省不到 {args.min_saving_pct}%)", pix_fmt)
 
     best_crf = search_res.get("crf")
     best_vmaf = round(search_res.get("vmaf", 0.0), 2)
@@ -385,13 +737,26 @@ def process_file_abav1(src_path, out_path, args):
         logger.info("   ✅ [PREVIEW 成功] （Preview 模式试压测算完毕，不保存文件）。")
         return "success", orig_mb, pred_size_mb, pred_saving, best_vmaf, best_crf, "PREVIEW成功", pix_fmt
 
-    # 6. 执行全量转码
+    # 8. 执行全量转码
     logger.info(f"   [全量转码中] 目标文件: {out_path}...")
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    ok = run_ab_av1_encode(src_path, out_path, args.encoder, best_crf, args.preset)
+    ok, encode_err = run_ab_av1_encode(src_path, out_path, args.encoder, best_crf, args.preset)
+    if not ok and _AUDIO_MUX_ERROR.search(encode_err or ""):
+        # 🔴 老音轨退路（2026-10-14 从备份引擎 vcompress.py:861-871 补齐）。
+        # DVD 抓轨、老相机 AVI 的音轨常是 MP2/PCM，MP4/MOV 装不下，`-c:a copy`
+        # 会被 muxer 拒——闸门好不容易过了，整片编码倒在这一步。
+        # 退成 aac 重来一次。**绝不是丢音轨**：换一种容器认的编码而已，红线 §10
+        # 禁的是「静默丢」，不是不许转码。宁可笑纳一次白跑，也不静默丢声音。
+        # ⚠ 只对 muxer 拒收音轨这类失败走（2026-10-14 复检收紧）：盘满、SMB 断连、
+        # VAAPI 故障重试也救不回来，白跑一遍整片编码纯属浪费，如实报 failed 即可。
+        logger.warning("   [重试] 音轨 copy 被 muxer 拒收（源音频格式 MP4/MOV 装不下？），改用 aac 重来一次…")
+        ok, encode_err = run_ab_av1_encode(src_path, out_path, args.encoder, best_crf, args.preset, audio='aac')
     if not ok or not out_path.exists():
-        logger.error("   [失败] 全量编码异常终止。")
+        if encode_err:
+            logger.error(f"   [失败] 全量编码异常终止：{_AUDIO_MUX_ERROR.sub('', encode_err).strip()[:300]}")
+        else:
+            logger.error("   [失败] 全量编码异常终止。")
         # 🔴 ffmpeg 是直接往最终路径写的（-y），失败时盘上留着半个文件。
         # 不删它，下一轮的续压守卫（存在且非空 → 跳过）就会把这个**没过闸门的
         # 残片**当成压好的产物，而残片和真产物同名、外部扫描也认不出来。
@@ -471,7 +836,10 @@ def unmarked_name(rel_path):
     if p.suffix == COMPRESSED_MARKER:
         return str(p.with_name(p.stem))
     if not p.stem.endswith(COMPRESSED_MARKER):
-        return str(rel_path)
+        # 配不上就抛，绝不返回一个「差不多」的名字：返回原名会让下游把产物
+        # 连到它自己，或连到一个碰巧同名的无关文件（红线：宁可拒绝，不可错）。
+        # 与 `naming.py` / vcat `compress_worker.py` 同一口径（ADR-020）。
+        raise ValueError(f"不是压缩产物名（缺 {{COMPRESSED_MARKER}} 标记）：{{rel_path}}")
     return str(p.with_name(f"{{p.stem[:-len(COMPRESSED_MARKER)]}}{{p.suffix}}"))
 
 def main():
@@ -621,6 +989,10 @@ def main():
     parser.add_argument('--skip-hdr', dest='skip_hdr', action='store_true', help='自动跳过 10-bit / HDR 视频以保持极高性价比')
     parser.add_argument('--no-skip-hdr', dest='skip_hdr', action='store_false', help='强制压制 10-bit / HDR 视频')
     parser.set_defaults(skip_hdr=False)
+    parser.add_argument('--allow-bitdepth-downgrade', action='store_true',
+                        help='允许 10bit 源被降到 8bit（默认拒绝：banding 不可逆且 VMAF 测不出）')
+    parser.add_argument('--no-chroma-downgrade', action='store_true',
+                        help='拒绝色度降级，如 4:2:2→4:2:0（默认放行但一律记入报表第 8 列）')
     parser.add_argument('--vmaf-threads', type=int, default=6, help='VMAF 计算允许的最大线程数 (默认 6，预算 ~8GB RAM)')
     parser.add_argument('--no-vmaf-scale', dest='vmaf_scale_1080p', action='store_false', help='关闭 VMAF 计算时的 1080p 缩放 (默认开启 1080p 缩放)')
     parser.set_defaults(vmaf_scale_1080p=True)

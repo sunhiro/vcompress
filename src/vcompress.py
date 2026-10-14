@@ -50,13 +50,30 @@ from fullset import (read_manifest, write_manifest, manifest_row, full_hash,
                      plan_move_untouched, apply_moves)
 
 # Setup logging
+# 🔴 日志文件**不落在当前工作目录**：本引擎在 NAS 上是 `docker run ... -u /repo/src/
+#    vcompress.py` 进去跑的，落点是 -i 指的那个素材树跑批时的 CWD —— 跑一次就在人家的
+#    素材目录里留一个 `vcompress.log`。改为用户级状态目录，`VCOMPRESS_LOG_DIR` 可覆盖；
+#    目录建不出来就退回只打 stdout。与 `vcompress_abav1.py` 同一口径。
+def _log_file_handler():
+    base = os.environ.get('VCOMPRESS_LOG_DIR')
+    try:
+        log_dir = Path(base) if base else Path.home() / '.cache' / 'vcompress'
+        log_dir.mkdir(parents=True, exist_ok=True)
+        return logging.FileHandler(log_dir / 'vcompress.log', mode='a', encoding='utf-8')
+    except (OSError, RuntimeError) as exc:
+        print(f"[WARN] 日志文件不可写（{exc}），本次仅输出到 stdout", file=sys.stderr)
+        return None
+
+
+_log_handlers = [logging.StreamHandler(sys.stdout)]
+_file_handler = _log_file_handler()
+if _file_handler is not None:
+    _log_handlers.append(_file_handler)
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler("vcompress.log", mode='a', encoding='utf-8')
-    ]
+    handlers=_log_handlers
 )
 logger = logging.getLogger("video_compressor")
 
@@ -183,7 +200,12 @@ def _strip_endian(pix_fmt):
 
 
 def pix_bit_depth(pix_fmt):
-    """读位深：yuv420p10le -> 10、p010le -> 10、yuv420p -> 8。认不出按 8 算（保守）。"""
+    """读位深：yuv420p10le -> 10、p010le -> 10、yuv420p -> 8。
+
+    ⚠ 「认不出按 8 算」只对**探不出来的元数据**（`?` / `""`）成立——不据此拦人。
+    对**认得出的格式名**，位深必须真解析：gray10le 曾一路漏到这里被按 8 放行，
+    10-bit 灰度源绕过 bitdepth_guard 静默降成 8bit（2026-10-14 复检发现的真缺陷）。
+    """
     base = _strip_endian(pix_fmt)
     if base in _SEMI_PLANAR:
         return _SEMI_PLANAR[base][0]
@@ -193,6 +215,9 @@ def pix_bit_depth(pix_fmt):
             return int(m.group(1))
         except ValueError:
             pass
+    g = re.search(r'gray(\d+)$', base)       # gray 族：gray10le / gray12be …（裸 gray 是 8bit）
+    if g:
+        return int(g.group(1))
     return 8
 
 
