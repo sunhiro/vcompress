@@ -996,7 +996,7 @@ def main():
     parser.add_argument('-o', '--output', required=True, type=Path, help='输出文件或目标目录')
     parser.add_argument('-e', '--encoder', choices=['vt', 'svt-av1', 'x265', 'vaapi', 'x264'], default='vt', help='编码引擎 (vt=Mac硬件, svt-av1=AV1, x265=H.265, vaapi=Intel核显)')
     parser.add_argument('--vmaf-min', type=float, default=93.0, help='最低允许 VMAF 画质门限 (默认 93.0)')
-    parser.add_argument('--min-saving-pct', type=float, default=20.0, help='最低空间节省率比例 (默认 20.0%%)')
+    parser.add_argument('--min-saving-pct', type=float, default=35.0, help='最低空间节省率比例 (默认 35.0%%)')
     parser.add_argument('--min-file-mb', type=float, default=20.0, help='跳过压缩的小文件阈值 MB (默认 20.0MB)')
     parser.add_argument('--max-hevc-bitrate', type=float, default=30.0, help='HEVC 视频最大跳过码率 Mbps，低于此码率的 HEVC 不再重压 (默认 30.0Mbps)')
     parser.add_argument('--min-bitrate', type=float, default=2.5, help='视频最低码率 Mbps，低于此码率视频跳过重压 (默认 2.5Mbps)')
